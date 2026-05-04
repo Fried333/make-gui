@@ -198,6 +198,41 @@ function _addrToP2shSpk(addr) {
   // OP_HASH160 push20 hash160 OP_EQUAL
   return new Uint8Array([0xa9, 0x14, ...h, 0x87]);
 }
+// Look up the compressed pubkey for an R-address by finding any prior tx
+// where it spent. For P2PKH inputs the scriptSig is `<sig> <pubkey>` —
+// the pubkey is the second push and is exactly 33 bytes (compressed).
+async function getPubkeyForRAddress(rAddr) {
+  // validateaddress is fast if the address is in the local wallet.
+  try {
+    const v = await rpc("validateaddress", [rAddr]);
+    if (v?.pubkey) return v.pubkey;
+  } catch {}
+  // Otherwise scan the address's tx history for a spending input.
+  let txids = [];
+  try {
+    txids = await rpc("getaddresstxids", [{ addresses: [rAddr] }]);
+  } catch { return null; }
+  for (let i = txids.length - 1; i >= 0; i--) {
+    try {
+      const tx = await rpc("getrawtransaction", [txids[i], 1]);
+      for (const vin of tx?.vin || []) {
+        const ssHex = vin?.scriptSig?.hex;
+        if (!ssHex) continue;
+        const inAddrs = vin?.addresses || [];
+        if (!inAddrs.includes(rAddr)) continue;
+        const bytes = _hexToBytes(ssHex);
+        let off = 0;
+        const sigLen = bytes[off]; off += 1 + sigLen;
+        if (off >= bytes.length) continue;
+        const pkLen = bytes[off]; off += 1;
+        if ((pkLen !== 33 && pkLen !== 65) || off + pkLen > bytes.length) continue;
+        return _bytesToHex(bytes.slice(off, off + pkLen));
+      }
+    } catch {}
+  }
+  return null;
+}
+
 // Pull a loan.request payload directly from the local daemon by reading the
 // originating tx and decoding the contentmultimap update. Used as a fallback
 // when scan.verus.cx is rate-limiting the explorer API.
@@ -1000,15 +1035,20 @@ async function enrichMatchRowTerms(rowEl, r, token) {
   let req = null;
   let lastError = null;
   try {
-    // Look up the linked request — try current state first, then history.
-    // Use cache-first: matches don't change once posted, so localStorage hits
-    // skip the network entirely on subsequent loads.
-    const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
-    if (cur) {
-      req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+    // Daemon-first: pull the original loan.request payload from the on-chain
+    // tx that posted it. Cheaper than the explorer and not rate-limited.
+    if (r.request?.txid) {
+      try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
+    }
+    // Explorer fallback: only hit it if the daemon couldn't resolve.
+    if (!req) {
+      const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
+      if (cur) {
+        req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+      }
     }
     if (!req) {
-      // Fallback: pull from history (the request may have been removed from current state)
+      // History fallback: the request may have been removed from current state
       const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
       if (hist) {
         const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid)
@@ -1143,8 +1183,10 @@ function renderMarketRequest(r, mySet, myMap, acting) {
   const mine = mySet.has(r.iaddr);
   const isActing = acting && acting !== "all" && r.iaddr === acting;
   const me = myMap.get(r.iaddr);
+  const requestKey = `req-${r.iaddr}-${r.posted_tx || ""}`;
+  requestByKey.set(requestKey, r);
   return `
-    <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28">
+    <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28" data-request-key="${escapeHtml(requestKey)}">
       <div class="row">
         <strong style="flex:1">${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
         <span class="badge loan-request">Loan request</span>
@@ -1160,12 +1202,14 @@ function renderMarketRequest(r, mySet, myMap, acting) {
       <div class="row" style="margin-top:10px">
         ${mine
           ? `<button class="ghost remove-btn" data-mp-row-act="cancel" style="flex:0 0 auto">Cancel request</button>`
-          : `<button class="primary" disabled title="Phase C — partial Tx-A construction">Set up loan</button>
-             <button class="ghost"   disabled title="Phase C — encrypted z-memo via privateaddress">Contact</button>`}
+          : `<button class="primary" data-mp-row-act="post-match" style="flex:0 0 auto">Post match — fund this loan</button>`}
       </div>
+      <div class="post-match-panel" style="display:none;margin-top:10px"></div>
     </div>
   `;
 }
+const requestByKey = new Map();
+const lenderInfoCache = new Map();
 
 function renderMarketOffer(r, mySet, myMap, acting) {
   const mine = mySet.has(r.iaddr);
@@ -1349,6 +1393,217 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
 
   if (action === "message-send") {
     alert("Z-memo send: Phase C — z_sendmany call not wired in this build yet. The privateaddress lookup works; only the actual broadcast is pending.");
+    return;
+  }
+
+  if (action === "post-match") {
+    const requestKey = row.dataset.requestKey;
+    const r = requestByKey.get(requestKey);
+    const panel = row.querySelector(".post-match-panel");
+    panel.style.display = "block";
+    panel.innerHTML = `<div class="review muted">looking up your funding options…</div>`;
+    try {
+      const acting = actingIaddr();
+      if (!acting || acting === "all") throw new Error("select your lender identity in the picker first");
+      if (acting === r.iaddr) throw new Error("can't post a match against your own request");
+      // Borrower's primary R + pubkey — needed for the 2-of-2 vault.
+      const borrowerInfo = await rpc("getidentity", [r.iaddr]);
+      const borrowerR = (borrowerInfo?.identity?.primaryaddresses || [])[0];
+      if (!borrowerR) throw new Error("borrower identity has no primary R-address");
+      // Lender's primary R + pubkey.
+      const lenderInfo = await rpc("getidentity", [acting]);
+      const lenderR = (lenderInfo?.identity?.primaryaddresses || [])[0];
+      if (!lenderR) throw new Error("acting identity has no primary R-address");
+      const [lenderPubkey, borrowerPubkey] = await Promise.all([
+        getPubkeyForRAddress(lenderR),
+        getPubkeyForRAddress(borrowerR),
+      ]);
+      if (!lenderPubkey) throw new Error(`couldn't resolve lender pubkey from ${lenderR} — has this address ever signed a tx?`);
+      if (!borrowerPubkey) throw new Error(`couldn't resolve borrower pubkey from ${borrowerR} — has this address ever signed a tx?`);
+      // Find a UTXO at lender's R that has the principal currency.
+      const principalCcy = r.principal?.currency;
+      const principalAmt = parseFloat(r.principal?.amount ?? 0);
+      const principalSats = Math.round(principalAmt * 1e8);
+      if (!principalCcy || !principalAmt) throw new Error("request principal missing");
+      const utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
+      const candidates = utxos.filter((u) => {
+        const cv = u.currencyvalues || {};
+        if (principalCcy === "VRSC" || principalCcy === "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV") {
+          return u.satoshis >= principalSats;
+        }
+        const have = parseFloat(Object.values(cv)[0] ?? 0);
+        // currencyvalues uses the currency i-address as the key — match by name resolved later
+        return Object.entries(cv).some(([k, v]) => k && parseFloat(v) >= principalAmt);
+      });
+      const exact = candidates.find((u) => {
+        if (principalCcy === "VRSC") return u.satoshis === principalSats;
+        return Object.values(u.currencyvalues || {}).some((v) => parseFloat(v) === principalAmt);
+      });
+      // Render form with the discovered options.
+      panel.innerHTML = `
+        <div class="review">
+          <strong>Post a pre-signed match for ${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
+          <div class="kv" style="margin-top:8px;font-size:12px">
+            <div><span class="k">you commit</span><span class="v">${escapeHtml(formatAmount(r.principal))} (principal)</span></div>
+            <div><span class="k">borrower commits</span><span class="v">${escapeHtml(formatAmount(r.collateral))} (collateral)</span></div>
+            <div><span class="k">repayment</span><span class="v">${escapeHtml(formatAmount(r.repay))} in ${r.term_days ?? "?"} days</span></div>
+            <div><span class="k">acting as</span><span class="v">${escapeHtml(lenderInfo?.identity?.fullyqualifiedname || acting)}</span></div>
+            <div><span class="k">vault P2SH</span><span class="v"><span class="muted vault-preview">computing…</span></span></div>
+          </div>
+          ${exact
+            ? `<div style="margin-top:10px"><span class="muted" style="font-size:12px">Funding UTXO: <code>${escapeHtml(exact.txid.slice(0, 16))}…:${exact.outputIndex}</code> (exact match) ✓</span></div>`
+            : candidates.length
+              ? `<div style="margin-top:10px;color:var(--warn);font-size:12px">No exact-amount UTXO. Will split a larger UTXO first via sendcurrency, then post the match.</div>`
+              : `<div style="margin-top:10px;color:var(--bad);font-size:12px">No ${escapeHtml(principalCcy)} UTXO at ${escapeHtml(lenderR)} large enough to fund ${escapeHtml(formatAmount(r.principal))}.</div>`}
+          ${candidates.length ? `<button class="primary" data-mp-row-act="post-match-go" style="margin-top:10px">${exact ? "Build, sign, post match" : "Split UTXO, then build & post"}</button>` : ""}
+          <div class="post-match-result" style="margin-top:8px"></div>
+        </div>
+      `;
+      // Compute vault P2SH async (cosmetic preview).
+      try {
+        const ms = await rpc("createmultisig", [2, [lenderPubkey, borrowerPubkey]]);
+        const vp = panel.querySelector(".vault-preview");
+        if (vp) vp.innerHTML = `<code>${escapeHtml(ms.address)}</code>`;
+        // Stash for the submit handler.
+        panel.dataset.lenderPubkey = lenderPubkey;
+        panel.dataset.borrowerPubkey = borrowerPubkey;
+        panel.dataset.lenderR = lenderR;
+        panel.dataset.borrowerR = borrowerR;
+        panel.dataset.vaultAddress = ms.address;
+        panel.dataset.vaultRedeem = ms.redeemScript;
+        panel.dataset.acting = acting;
+        panel.dataset.requestIaddr = r.iaddr;
+        panel.dataset.requestTxid = r.posted_tx || r.request?.txid || "";
+        panel.dataset.requestBlock = String(r.posted_block || 0);
+        panel.dataset.principalCurrency = principalCcy;
+        panel.dataset.principalAmount = String(principalAmt);
+        panel.dataset.actingFqn = lenderInfo?.identity?.fullyqualifiedname || acting;
+        panel.dataset.actingParent = lenderInfo?.identity?.parent || "";
+        panel.dataset.actingName = lenderInfo?.identity?.name || "";
+      } catch (e) {
+        const vp = panel.querySelector(".vault-preview");
+        if (vp) vp.textContent = `(could not derive vault: ${e.message})`;
+      }
+    } catch (e) {
+      panel.innerHTML = `<div class="review" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
+    }
+    return;
+  }
+
+  if (action === "post-match-go") {
+    const panel = row.querySelector(".post-match-panel");
+    const resultEl = panel.querySelector(".post-match-result") || panel;
+    btn.disabled = true; btn.textContent = "Working…";
+    try {
+      const ds = panel.dataset;
+      const principalCcy = ds.principalCurrency;
+      const principalAmt = parseFloat(ds.principalAmount);
+      const principalSats = Math.round(principalAmt * 1e8);
+      const lenderR = ds.lenderR;
+      const borrowerR = ds.borrowerR;
+      const acting = ds.acting;
+
+      // Find or create an exact UTXO for the principal currency.
+      let utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
+      const findExact = () => utxos.find((u) => {
+        if (principalCcy === "VRSC") return u.satoshis === principalSats;
+        return Object.values(u.currencyvalues || {}).some((v) => parseFloat(v) === principalAmt);
+      });
+      let exact = findExact();
+      if (!exact) {
+        btn.textContent = "Splitting UTXO via sendcurrency…";
+        const out = principalCcy === "VRSC"
+          ? [{ address: lenderR, amount: principalAmt }]
+          : [{ currency: principalCcy, amount: principalAmt, address: lenderR }];
+        const opid = await rpc("sendcurrency", [lenderR, out]);
+        // Poll for completion.
+        let txid = null;
+        for (let i = 0; i < 30 && !txid; i++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const res = await rpc("z_getoperationresult", [[opid]]);
+          const op = (res || [])[0];
+          if (op?.status === "success") txid = op.result?.txid;
+          if (op?.status === "failed") throw new Error("split sendcurrency failed: " + JSON.stringify(op.error || {}));
+        }
+        if (!txid) throw new Error("split sendcurrency timed out");
+        btn.textContent = "Waiting for split tx to confirm…";
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 5000));
+          const ginfo = await rpc("gettransaction", [txid]).catch(() => null);
+          if ((ginfo?.confirmations ?? 0) >= 1) break;
+        }
+        utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
+        exact = findExact();
+        if (!exact) throw new Error("split confirmed but no exact-amount UTXO appeared");
+      }
+
+      btn.textContent = "Building Tx-A skeleton…";
+      // For VRSC: simple address->amount. For other currencies: address->{currency_iaddr: amount}.
+      let outputs;
+      if (principalCcy === "VRSC") {
+        outputs = { [borrowerR]: principalAmt };
+      } else {
+        // Need the currency's iaddr.
+        const ccyInfo = await rpc("getcurrency", [principalCcy]);
+        const ccyIaddr = ccyInfo?.currencyid;
+        if (!ccyIaddr) throw new Error(`could not resolve currency id for ${principalCcy}`);
+        outputs = { [borrowerR]: { [ccyIaddr]: principalAmt } };
+      }
+      const tip = await rpc("getblockcount");
+      const expiryHeight = tip + 720; // ~12 hours
+      const unsignedHex = await rpc("createrawtransaction", [
+        [{ txid: exact.txid, vout: exact.outputIndex }],
+        outputs,
+        0,
+        expiryHeight,
+      ]);
+
+      btn.textContent = "Signing SIGHASH_SINGLE|ANYONECANPAY…";
+      const signed = await rpc("signrawtransaction", [unsignedHex, null, null, "SINGLE|ANYONECANPAY"]);
+      if (!signed.complete) throw new Error("Tx-A sign failed: " + JSON.stringify(signed.errors || {}));
+
+      btn.textContent = "Posting loan.match…";
+      // Build the match payload.
+      const match = {
+        version: 1,
+        request: {
+          iaddr: ds.requestIaddr,
+          txid: ds.requestTxid,
+          block: parseInt(ds.requestBlock || "0"),
+        },
+        lender_address: lenderR,
+        vault_address: ds.vaultAddress,
+        vault_redeem_script: ds.vaultRedeem,
+        tx_a_partial: signed.hex,
+        tx_repay_partial: "",
+        tx_b_partial: "",
+        expires_block: expiryHeight,
+        active: true,
+      };
+      const payloadHex = Array.from(new TextEncoder().encode(JSON.stringify(match)))
+        .map((b) => b.toString(16).padStart(2, "0")).join("");
+
+      // Read existing multimap entries on lender's identity to merge with our new one.
+      const existing = (lenderInfoCache.get(acting) || (await rpc("getidentity", [acting])).identity)?.contentmultimap || {};
+      const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+      const newMultimap = { ...existing };
+      // Replace any existing match against the same request (idempotent).
+      newMultimap[VDXF_LOAN_MATCH] = [payloadHex];
+
+      const updateTxid = await rpc("updateidentity", [{
+        name: ds.actingName,
+        parent: ds.actingParent,
+        contentmultimap: newMultimap,
+      }]);
+      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">✓ Match posted: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(updateTxid)}" target="_blank"><code>${escapeHtml(updateTxid)}</code></a><br>Borrower can now click Accept on this match.</div>`;
+      btn.style.display = "none";
+      // Bust the marketplace cache so the next loadMarket picks up the new match.
+      invalidateMarketCache();
+    } catch (e) {
+      resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
+      btn.disabled = false;
+      btn.textContent = "Retry";
+    }
     return;
   }
 
