@@ -61,6 +61,181 @@ function decodeMultimapEntry(entry) {
   }
 }
 
+// ---------- Sapling tx parser/serializer for extending pre-signed partials ----------
+// Borrower-side: take the lender's SIGHASH_SINGLE|ANYONECANPAY-signed Tx-A,
+// add the borrower's collateral input + vault P2SH output + change output,
+// without touching the lender's input 0 or output 0. Direct port of
+// helpers/extend_tx.py — see TESTING.md §25 for the validated pattern.
+
+function _hexToBytes(h) {
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < h.length; i += 2) out[i / 2] = parseInt(h.slice(i, i + 2), 16);
+  return out;
+}
+function _bytesToHex(b) {
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+function _readVarint(b, off) {
+  const v = b[off];
+  if (v < 0xfd) return [v, off + 1];
+  if (v === 0xfd) return [b[off + 1] | (b[off + 2] << 8), off + 3];
+  if (v === 0xfe) return [(b[off + 1] | (b[off + 2] << 8) | (b[off + 3] << 16) | (b[off + 4] << 24)) >>> 0, off + 5];
+  // 64-bit varint — JS bitwise can't handle. Use BigInt.
+  let n = 0n;
+  for (let i = 0; i < 8; i++) n |= BigInt(b[off + 1 + i]) << BigInt(8 * i);
+  return [Number(n), off + 9];
+}
+function _writeVarint(n) {
+  if (n < 0xfd) return new Uint8Array([n]);
+  if (n <= 0xffff) return new Uint8Array([0xfd, n & 0xff, (n >> 8) & 0xff]);
+  if (n <= 0xffffffff) {
+    return new Uint8Array([0xfe, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff]);
+  }
+  const out = new Uint8Array(9); out[0] = 0xff;
+  let big = BigInt(n);
+  for (let i = 0; i < 8; i++) { out[1 + i] = Number(big & 0xffn); big >>= 8n; }
+  return out;
+}
+function _readU32(b, off) {
+  return (b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)) >>> 0;
+}
+function _writeU32(n) {
+  return new Uint8Array([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff]);
+}
+function _readI64LE(b, off) {
+  let n = 0n;
+  for (let i = 0; i < 8; i++) n |= BigInt(b[off + i]) << BigInt(8 * i);
+  return n;
+}
+function _writeI64LE(n) {
+  const out = new Uint8Array(8);
+  let big = BigInt(n);
+  for (let i = 0; i < 8; i++) { out[i] = Number(big & 0xffn); big >>= 8n; }
+  return out;
+}
+function _parseTx(hex) {
+  const b = _hexToBytes(hex);
+  let off = 0;
+  const versionRaw = _readU32(b, off); off += 4;
+  const fOverwintered = (versionRaw >>> 31) & 1;
+  const nVersion = versionRaw & 0x7fffffff;
+  let nVersionGroupId = 0;
+  if (fOverwintered) { nVersionGroupId = _readU32(b, off); off += 4; }
+  let vinCount; [vinCount, off] = _readVarint(b, off);
+  const vins = [];
+  for (let i = 0; i < vinCount; i++) {
+    const prevTxid = b.slice(off, off + 32); off += 32;
+    const prevVout = _readU32(b, off); off += 4;
+    let ssLen; [ssLen, off] = _readVarint(b, off);
+    const scriptSig = b.slice(off, off + ssLen); off += ssLen;
+    const sequence = _readU32(b, off); off += 4;
+    vins.push({ prevTxid, prevVout, scriptSig, sequence });
+  }
+  let voutCount; [voutCount, off] = _readVarint(b, off);
+  const vouts = [];
+  for (let i = 0; i < voutCount; i++) {
+    const value = _readI64LE(b, off); off += 8;
+    let spkLen; [spkLen, off] = _readVarint(b, off);
+    const scriptPubKey = b.slice(off, off + spkLen); off += spkLen;
+    vouts.push({ value, scriptPubKey });
+  }
+  const nLockTime = _readU32(b, off); off += 4;
+  let nExpiryHeight = 0;
+  if (fOverwintered) { nExpiryHeight = _readU32(b, off); off += 4; }
+  const remainder = b.slice(off);
+  return { fOverwintered, nVersion, nVersionGroupId, vins, vouts, nLockTime, nExpiryHeight, remainder };
+}
+function _serializeTx(tx) {
+  const parts = [];
+  const versionRaw = ((tx.nVersion & 0x7fffffff) | ((tx.fOverwintered & 1) << 31)) >>> 0;
+  parts.push(_writeU32(versionRaw));
+  if (tx.fOverwintered) parts.push(_writeU32(tx.nVersionGroupId));
+  parts.push(_writeVarint(tx.vins.length));
+  for (const v of tx.vins) {
+    parts.push(v.prevTxid);
+    parts.push(_writeU32(v.prevVout));
+    parts.push(_writeVarint(v.scriptSig.length));
+    parts.push(v.scriptSig);
+    parts.push(_writeU32(v.sequence));
+  }
+  parts.push(_writeVarint(tx.vouts.length));
+  for (const o of tx.vouts) {
+    parts.push(_writeI64LE(o.value));
+    parts.push(_writeVarint(o.scriptPubKey.length));
+    parts.push(o.scriptPubKey);
+  }
+  parts.push(_writeU32(tx.nLockTime));
+  if (tx.fOverwintered) parts.push(_writeU32(tx.nExpiryHeight));
+  parts.push(tx.remainder);
+  let total = 0; for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const p of parts) { out.set(p, pos); pos += p.length; }
+  return _bytesToHex(out);
+}
+const _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function _b58dec(s) {
+  let n = 0n;
+  for (const c of s) { const idx = _B58.indexOf(c); if (idx < 0) throw new Error("bad base58"); n = n * 58n + BigInt(idx); }
+  const bytes = [];
+  while (n > 0n) { bytes.unshift(Number(n & 0xffn)); n >>= 8n; }
+  let pad = 0;
+  for (const c of s) { if (c === "1") pad++; else break; }
+  return new Uint8Array([...new Array(pad).fill(0), ...bytes]);
+}
+function _addrToHash160(addr) {
+  const raw = _b58dec(addr);
+  if (raw.length !== 25) throw new Error(`expected 25 bytes for ${addr}, got ${raw.length}`);
+  return raw.slice(1, 21);
+}
+function _addrToP2pkhSpk(addr) {
+  const h = _addrToHash160(addr);
+  // OP_DUP OP_HASH160 push20 hash160 OP_EQUALVERIFY OP_CHECKSIG
+  return new Uint8Array([0x76, 0xa9, 0x14, ...h, 0x88, 0xac]);
+}
+function _addrToP2shSpk(addr) {
+  const h = _addrToHash160(addr);
+  // OP_HASH160 push20 hash160 OP_EQUAL
+  return new Uint8Array([0xa9, 0x14, ...h, 0x87]);
+}
+// Pull a loan.request payload directly from the local daemon by reading the
+// originating tx and decoding the contentmultimap update. Used as a fallback
+// when scan.verus.cx is rate-limiting the explorer API.
+async function fetchRequestFromLocalDaemon(txid) {
+  const VDXF_LOAN_REQUEST = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+  const tx = await rpc("getrawtransaction", [txid, 1]);
+  // The identity update is in tx.vout — find the one that has an identity
+  // primary output and pull the contentmultimap from its scriptPubKey.
+  for (const vout of tx?.vout || []) {
+    const cm = vout?.scriptPubKey?.identityprimary?.contentmultimap;
+    if (cm && cm[VDXF_LOAN_REQUEST]) {
+      const entry = cm[VDXF_LOAN_REQUEST][0];
+      const hex = typeof entry === "string" ? entry : entry?.serializedhex || entry?.message || "";
+      if (!hex) continue;
+      try {
+        const json = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+        return { principal: json.principal, collateral: json.collateral, repay: json.repay, term_days: json.term_days };
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function extendPresignedLoanTxA({ presignedHex, borrowerInputTxid, borrowerInputVout, vaultP2sh, collateralSats, borrowerChangeAddr, borrowerChangeSats }) {
+  const tx = _parseTx(presignedHex);
+  if (tx.vins.length !== 1 || tx.vouts.length !== 1) {
+    throw new Error(`expected pre-signed Tx-A with 1 input + 1 output, got ${tx.vins.length}/${tx.vouts.length}`);
+  }
+  // Append borrower input (empty scriptSig — to be signed by daemon)
+  const txidBytes = _hexToBytes(borrowerInputTxid).reverse(); // LE
+  tx.vins.push({ prevTxid: txidBytes, prevVout: borrowerInputVout, scriptSig: new Uint8Array(0), sequence: 0xffffffff });
+  // Append vault collateral output (P2SH)
+  tx.vouts.push({ value: BigInt(collateralSats), scriptPubKey: _addrToP2shSpk(vaultP2sh) });
+  // Append borrower change output (P2PKH)
+  tx.vouts.push({ value: BigInt(borrowerChangeSats), scriptPubKey: _addrToP2pkhSpk(borrowerChangeAddr) });
+  return _serializeTx(tx);
+}
+
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -865,6 +1040,10 @@ async function enrichMatchRowTerms(rowEl, r, token) {
     <div>You receive: <strong>${formatAmount(req.principal)}</strong></div>
     <div>You repay: <strong>${formatAmount(req.repay)}</strong> in <strong>${req.term_days ?? "?"} days</strong> (${rate})</div>
   `;
+  // Stash the full resolved request keyed by matchKey so the Accept handler
+  // can reuse it after subsequent loadMarket re-renders.
+  const mKey = `match-${r.match_iaddr}-${r.posted_tx || ""}`;
+  matchResolvedRequest.set(mKey, req);
   // Stash collateral currency on the row for the balance enrichment
   rowEl.dataset.collateralCurrency = req.collateral?.currency || "";
   rowEl.dataset.collateralAmount = String(req.collateral?.amount ?? "");
@@ -1012,6 +1191,9 @@ function renderMarketOffer(r, mySet, myMap, acting) {
 }
 
 const matchByKey = new Map();
+// Survives loadMarket re-renders so the Accept handler always sees terms
+// resolved by a prior enrichMatchRowTerms call.
+const matchResolvedRequest = new Map();
 
 async function renderCommsTab(el, acting, myToken) {
   // Communications via VerusID privateaddress (sapling z-memos).
@@ -1176,11 +1358,14 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const panel = row.querySelector(".accept-panel");
     panel.style.display = "block";
     panel.innerHTML = `<div class="review muted">looking up request terms…</div>`;
-    // Pull the linked request to know the exact amounts
-    let req = null;
+    // Reuse what enrichMatchRowTerms already resolved if present — saves a
+    // round-trip and keeps Accept usable when the explorer is rate-limiting.
+    let req = matchResolvedRequest.get(matchKey) || null;
     try {
-      const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
-      if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+      if (!req) {
+        const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
+        if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+      }
       if (!req) {
         const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
         if (hist) {
@@ -1189,7 +1374,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
         }
       }
+      // Local daemon fallback — works without the explorer.
+      if (!req && r.request?.txid) {
+        try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
+      }
     } catch {}
+    if (req) matchResolvedRequest.set(matchKey, req);
+    const hasPartial = !!(r.tx_a_partial && r.tx_a_partial.length > 50);
     panel.innerHTML = `
       <div class="review">
         <strong>If you accept this match…</strong>
@@ -1199,12 +1390,91 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           <li>You repay <strong>${formatAmount(req?.repay)}</strong> within <strong>${req?.term_days ?? "?"} days</strong></li>
           <li>Pre-signed Tx-Repay (cooperative) and Tx-B (default-after-maturity) are usable for either path</li>
         </ul>
-        <strong style="color:var(--warn)">Acceptance not yet implemented in this build.</strong>
-        <div class="muted" style="font-size:11px;margin-top:4px">
-          Reason: this match's pre-signed templates are placeholder hex (Phase C makeoffer integration pending — DAI.vETH cryptocondition currencies don't support ANYONECANPAY signing).
-        </div>
+        ${hasPartial
+          ? `<button class="primary" data-mp-row-act="accept-broadcast" style="margin-top:6px">Broadcast Tx-A — borrow ${escapeHtml(formatAmount(req?.principal))}</button>
+             <span class="muted" style="font-size:11px;margin-left:8px">Adds your collateral input + vault output to the lender's pre-signed Tx-A and broadcasts.</span>
+             <div class="accept-result" style="margin-top:8px"></div>`
+          : `<strong style="color:var(--warn)">Lender hasn't published a pre-signed Tx-A yet.</strong>
+             <div class="muted" style="font-size:11px;margin-top:4px">
+               This match's <code>tx_a_partial</code> field is empty. Ask the lender to re-post the match after pre-signing their input.
+             </div>`}
       </div>
     `;
+    return;
+  }
+
+  if (action === "accept-broadcast") {
+    const matchKey = row.dataset.matchKey;
+    const r = matchByKey.get(matchKey);
+    const panel = row.querySelector(".accept-panel");
+    const resultEl = panel.querySelector(".accept-result") || panel;
+    btn.disabled = true; btn.textContent = "Building Tx-A…";
+    try {
+      // Reuse the already-resolved request if available.
+      let req = matchResolvedRequest.get(matchKey) || null;
+      if (!req) {
+        const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
+        if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+      }
+      if (!req) {
+        const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
+        const ev = (hist?.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid) || (hist?.results || [])[0];
+        const p = ev?.entries?.[0]?.decoded;
+        if (p) req = p;
+      }
+      if (!req) throw new Error("can't find linked request — terms unknown");
+      const acting = actingIaddr();
+      if (!acting || acting === "all") throw new Error("select your borrower identity in the picker first");
+      // Resolve borrower R-address.
+      const idInfo = await rpc("getidentity", [acting]);
+      const borrowerR = (idInfo?.identity?.primaryaddresses || [])[0];
+      if (!borrowerR) throw new Error("borrower identity has no primary R-address");
+
+      // Find a UTXO at borrower R that covers collateral + fee.
+      const collCcy = req.collateral?.currency;
+      const collAmt = parseFloat(req.collateral?.amount ?? 0);
+      if (!collAmt) throw new Error("collateral amount missing in request");
+      const FEE = 0.0001;
+      const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
+      // For VRSC collateral, pick a P2PKH UTXO whose VRSC value >= collateral + fee.
+      let chosenUtxo = null;
+      if (collCcy === "VRSC" || collCcy === "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV") {
+        chosenUtxo = utxos
+          .filter((u) => u.satoshis >= Math.round((collAmt + FEE) * 1e8))
+          .sort((a, b) => a.satoshis - b.satoshis)[0];
+        if (!chosenUtxo) throw new Error(`no VRSC UTXO at ${borrowerR} covers ${collAmt + FEE} VRSC`);
+      } else {
+        throw new Error(`borrower-side accept for ${collCcy} collateral not wired yet (only VRSC for now)`);
+      }
+      const inputSats = chosenUtxo.satoshis;
+      const collSats = Math.round(collAmt * 1e8);
+      const changeSats = inputSats - collSats - Math.round(FEE * 1e8);
+      if (changeSats < 0) throw new Error(`UTXO ${chosenUtxo.txid}:${chosenUtxo.outputIndex} too small`);
+
+      btn.textContent = "Extending pre-signed Tx-A…";
+      const extendedHex = extendPresignedLoanTxA({
+        presignedHex: r.tx_a_partial,
+        borrowerInputTxid: chosenUtxo.txid,
+        borrowerInputVout: chosenUtxo.outputIndex,
+        vaultP2sh: r.vault_address,
+        collateralSats: collSats,
+        borrowerChangeAddr: borrowerR,
+        borrowerChangeSats: changeSats,
+      });
+
+      btn.textContent = "Signing your input…";
+      const signed = await rpc("signrawtransaction", [extendedHex]);
+      if (!signed.complete) throw new Error("signing did not complete: " + JSON.stringify(signed.errors || {}));
+
+      btn.textContent = "Broadcasting…";
+      const txid = await rpc("sendrawtransaction", [signed.hex]);
+      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">✓ Tx-A broadcast: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(txid)}" target="_blank"><code>${escapeHtml(txid)}</code></a></div>`;
+      btn.style.display = "none";
+    } catch (e) {
+      resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
+      btn.disabled = false;
+      btn.textContent = "Retry broadcast";
+    }
     return;
   }
 
