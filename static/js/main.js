@@ -676,6 +676,17 @@ document.querySelectorAll('#market [data-mp-tab]').forEach((b) => {
   };
 });
 
+// "Show stale" toggle — persist + reload on change.
+const LS_KEY_SHOW_STALE = "vl_show_stale";
+const showStaleEl = document.getElementById("mp-show-stale");
+if (showStaleEl) {
+  showStaleEl.checked = localStorage.getItem(LS_KEY_SHOW_STALE) === "1";
+  showStaleEl.onchange = () => {
+    localStorage.setItem(LS_KEY_SHOW_STALE, showStaleEl.checked ? "1" : "0");
+    loadMarket();
+  };
+}
+
 // Two-level picker:
 //   R-address (your wallet root) → list of IDs under that R
 // If the chosen R has a single ID, the ID picker hides.
@@ -915,6 +926,23 @@ async function loadMarket() {
       rows = rows.filter((r) => inSet.has(r.iaddr));
     } else if (mpTab === "matches") {
       rows = rows.filter((r) => inSet.has(r.match_iaddr) || inSet.has(r.request?.iaddr));
+    }
+  }
+
+  // Staleness filter — hide entries past their explicit expiry (valid_until_block /
+  // expires_block) or, for entries with no expiry, anything posted more than
+  // STALE_BLOCK_AGE blocks ago (~7 days). Toggle off via the "Show stale" checkbox.
+  const showStale = document.getElementById("mp-show-stale")?.checked;
+  if (!showStale) {
+    const tip = await rpc("getblockcount").catch(() => null);
+    if (tip) {
+      const STALE_BLOCK_AGE = 7 * 1440; // ~7 days at 1-minute blocks
+      rows = rows.filter((r) => {
+        const expiry = r.valid_until_block ?? r.expires_block ?? null;
+        if (expiry !== null) return tip <= expiry;
+        if (r.posted_block) return tip - r.posted_block <= STALE_BLOCK_AGE;
+        return true;
+      });
     }
   }
 
