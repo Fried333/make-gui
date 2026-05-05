@@ -1553,8 +1553,9 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     panel.style.display = "block";
     panel.innerHTML = `<div class="review muted">looking up your funding options…</div>`;
     try {
-      const acting = actingIaddr();
-      if (!acting || acting === "all") throw new Error("select your lender identity in the picker first");
+      let acting = actingIaddr();
+      // For v2 requests we'll prefer target_lender_iaddr if it matches a local
+      // identity (resolved further down once we re-fetch the v2 fields).
       if (acting === r.iaddr) throw new Error("can't post a match against your own request");
       // Borrower's primary R + pubkey — needed for the 2-of-2 vault.
       // Also pulls the FULL loan.request payload from the multimap (the
@@ -1573,7 +1574,6 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
             if (!r.posted_tx || !json) {
               Object.assign(r, json);
             } else {
-              // Match the entry to this row by terms equality.
               if (Math.abs((json.principal?.amount || 0) - (r.principal?.amount || 0)) < 1e-8 &&
                   json.principal?.currency === r.principal?.currency &&
                   Math.abs((json.collateral?.amount || 0) - (r.collateral?.amount || 0)) < 1e-8) {
@@ -1583,6 +1583,20 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           } catch {}
         }
       } catch {}
+
+      // If this is a v2 directed request and we have target_lender_iaddr,
+      // and the picker isn't already pointed at a specific lender, snap acting
+      // to the targeted lender (must be one of the local wallet's identities).
+      if (r.target_lender_iaddr && (!acting || acting === "all")) {
+        const ids = await ensureSpendableIds();
+        if (ids.some((x) => x.iaddr === r.target_lender_iaddr)) {
+          acting = r.target_lender_iaddr;
+        }
+      }
+      if (!acting || acting === "all") throw new Error("select your lender identity in the picker first (or this request isn't directed at you)");
+      if (r.target_lender_iaddr && r.target_lender_iaddr !== acting) {
+        throw new Error(`request directed at ${r.target_lender_iaddr}, you are acting as ${acting}`);
+      }
       const borrowerR = (borrowerInfo?.identity?.primaryaddresses || [])[0];
       if (!borrowerR) throw new Error("borrower identity has no primary R-address");
       // Lender's primary R + pubkey.
