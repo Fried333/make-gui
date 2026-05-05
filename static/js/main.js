@@ -1035,12 +1035,16 @@ async function loadMarket() {
   else if (mpTab === "comms") { return renderCommsTab(el, acting, myToken); }
 
   // Strict filter: when a specific ID/R is picked, only show entries that involve them.
-  //   - requests/offers: posted by an in-scope iaddr
+  //   - requests: posted by an in-scope iaddr OR directed at an in-scope iaddr
+  //     (target_lender_iaddr — for lenders to see directed requests)
+  //   - offers: posted by an in-scope iaddr
   //   - matches: posted by in-scope (yours) OR pointing at in-scope (to-you)
   if (acting !== "all" || pickedR() !== "all") {
     const inScope = await inScopeIaddrs();
     const inSet = new Set(inScope);
-    if (mpTab === "requests" || mpTab === "offers") {
+    if (mpTab === "requests") {
+      rows = rows.filter((r) => inSet.has(r.iaddr) || (r.target_lender_iaddr && inSet.has(r.target_lender_iaddr)));
+    } else if (mpTab === "offers") {
       rows = rows.filter((r) => inSet.has(r.iaddr));
     } else if (mpTab === "matches") {
       rows = rows.filter((r) => inSet.has(r.match_iaddr) || inSet.has(r.request?.iaddr));
@@ -1553,7 +1557,32 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       if (!acting || acting === "all") throw new Error("select your lender identity in the picker first");
       if (acting === r.iaddr) throw new Error("can't post a match against your own request");
       // Borrower's primary R + pubkey — needed for the 2-of-2 vault.
+      // Also pulls the FULL loan.request payload from the multimap (the
+      // explorer's typed endpoint strips v2-only fields like the borrower's
+      // signed Tx-A skeleton, so we have to read it directly).
       const borrowerInfo = await rpc("getidentity", [r.iaddr]);
+      try {
+        const VDXF_LOAN_REQUEST = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+        const cm = borrowerInfo?.identity?.contentmultimap || {};
+        const entries = cm[VDXF_LOAN_REQUEST] || [];
+        for (const e of entries) {
+          const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+          if (!hex) continue;
+          try {
+            const json = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+            if (!r.posted_tx || !json) {
+              Object.assign(r, json);
+            } else {
+              // Match the entry to this row by terms equality.
+              if (Math.abs((json.principal?.amount || 0) - (r.principal?.amount || 0)) < 1e-8 &&
+                  json.principal?.currency === r.principal?.currency &&
+                  Math.abs((json.collateral?.amount || 0) - (r.collateral?.amount || 0)) < 1e-8) {
+                Object.assign(r, json);
+              }
+            }
+          } catch {}
+        }
+      } catch {}
       const borrowerR = (borrowerInfo?.identity?.primaryaddresses || [])[0];
       if (!borrowerR) throw new Error("borrower identity has no primary R-address");
       // Lender's primary R + pubkey.
