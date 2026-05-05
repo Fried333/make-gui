@@ -358,6 +358,22 @@ async function buildAndSignBorrowerTxA({
   return signed.hex;
 }
 
+// Lender-side: take the borrower's signed Tx-A skeleton (1 input, 3 outputs)
+// and prepend the lender's principal input as input 0 (with empty scriptSig
+// to be filled by signrawtransaction). Outputs are NOT touched — the
+// borrower locked them with SIGHASH_ALL|ANYONECANPAY. Borrower's signature
+// stays valid after their input shifts from index 0 to index 1 because the
+// SIGHASH hash doesn't include the input index.
+function prependLenderInput(borrowerSkeletonHex, lenderInputTxid, lenderInputVout) {
+  const tx = _parseTx(borrowerSkeletonHex);
+  if (tx.vins.length !== 1) throw new Error(`expected 1 input in borrower skeleton, got ${tx.vins.length}`);
+  if (tx.vouts.length < 2 || tx.vouts.length > 3) throw new Error(`expected 2 or 3 outputs in borrower skeleton, got ${tx.vouts.length}`);
+  const txidBytes = _hexToBytes(lenderInputTxid).reverse();
+  // Prepend (unshift) the lender's input as index 0
+  tx.vins.unshift({ prevTxid: txidBytes, prevVout: lenderInputVout, scriptSig: new Uint8Array(0), sequence: 0xffffffff });
+  return _serializeTx(tx);
+}
+
 function extendPresignedLoanTxA({ presignedHex, borrowerInputTxid, borrowerInputVout, vaultP2sh, collateralSats, borrowerChangeAddr, borrowerChangeSats }) {
   const tx = _parseTx(presignedHex);
   if (tx.vins.length !== 1 || tx.vouts.length !== 1) {
@@ -1607,6 +1623,11 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         panel.dataset.requestBlock = String(r.posted_block || 0);
         panel.dataset.principalCurrency = principalCcy;
         panel.dataset.principalAmount = String(principalAmt);
+        panel.dataset.collateralCurrency = r.collateral?.currency || "";
+        panel.dataset.collateralAmount = String(r.collateral?.amount ?? "");
+        panel.dataset.repayCurrency = r.repay?.currency || principalCcy;
+        panel.dataset.repayAmount = String(r.repay?.amount ?? "");
+        panel.dataset.termDays = String(r.term_days ?? 30);
         panel.dataset.actingFqn = lenderInfo?.identity?.fullyqualifiedname || acting;
         panel.dataset.actingParent = lenderInfo?.identity?.parent || "";
         panel.dataset.actingName = lenderInfo?.identity?.name || "";
@@ -1626,6 +1647,9 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     btn.disabled = true; btn.textContent = "Working…";
     try {
       const ds = panel.dataset;
+      const requestKey = row.dataset.requestKey;
+      const r = requestByKey.get(requestKey);
+      if (!r) throw new Error("request data missing — refresh and retry");
       const principalCcy = ds.principalCurrency;
       const principalAmt = parseFloat(ds.principalAmount);
       const principalSats = Math.round(principalAmt * 1e8);
@@ -1633,6 +1657,26 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       const borrowerR = ds.borrowerR;
       const acting = ds.acting;
 
+      // v2 borrower-first: read borrower's signed Tx-A skeleton from the request.
+      // v1 fallback: borrower never signed; we'd build Tx-A from scratch (legacy).
+      const borrowerSkeleton = r.borrower_input_signed_hex;
+      const isV2 = !!(borrowerSkeleton && r.target_lender_iaddr);
+      if (!isV2) throw new Error("v1 requests no longer supported in this build — borrower must repost as v2");
+      // Sanity: target_lender_iaddr must match our acting identity.
+      if (r.target_lender_iaddr && r.target_lender_iaddr !== acting) {
+        throw new Error(`request directed at ${r.target_lender_iaddr}, you are acting as ${acting}`);
+      }
+
+      // Decode the skeleton to verify shape. 2 outputs (bundled change to
+      // borrower) or 3 outputs (separate change address) both valid.
+      const decoded = await rpc("decoderawtransaction", [borrowerSkeleton]);
+      if (decoded.vin.length !== 1 || decoded.vout.length < 2 || decoded.vout.length > 3) {
+        throw new Error(`borrower skeleton has ${decoded.vin.length} inputs / ${decoded.vout.length} outputs (expected 1/2 or 1/3)`);
+      }
+      const vaultVout = decoded.vout.findIndex((o) => (o.scriptPubKey?.addresses || []).includes(ds.vaultAddress));
+      if (vaultVout < 0) throw new Error(`vault P2SH ${ds.vaultAddress} not found in borrower's skeleton outputs`);
+
+      btn.textContent = "Finding exact-amount UTXO for principal…";
       // Find or create an exact UTXO for the principal currency.
       let utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
       const findExact = () => utxos.find((u) => {
@@ -1646,7 +1690,6 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           ? [{ address: lenderR, amount: principalAmt }]
           : [{ currency: principalCcy, amount: principalAmt, address: lenderR }];
         const opid = await rpc("sendcurrency", [lenderR, out]);
-        // Poll for completion.
         let txid = null;
         for (let i = 0; i < 30 && !txid; i++) {
           await new Promise((r) => setTimeout(r, 2000));
@@ -1667,47 +1710,105 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         if (!exact) throw new Error("split confirmed but no exact-amount UTXO appeared");
       }
 
-      btn.textContent = "Building Tx-A skeleton…";
-      // For VRSC: simple address->amount. For other currencies: address->{currency_iaddr: amount}.
-      let outputs;
-      if (principalCcy === "VRSC") {
-        outputs = { [borrowerR]: principalAmt };
-      } else {
-        // Need the currency's iaddr.
-        const ccyInfo = await rpc("getcurrency", [principalCcy]);
-        const ccyIaddr = ccyInfo?.currencyid;
-        if (!ccyIaddr) throw new Error(`could not resolve currency id for ${principalCcy}`);
-        outputs = { [borrowerR]: { [ccyIaddr]: principalAmt } };
-      }
-      const tip = await rpc("getblockcount");
-      const expiryHeight = tip + 720; // ~12 hours
-      const unsignedHex = await rpc("createrawtransaction", [
-        [{ txid: exact.txid, vout: exact.outputIndex }],
-        outputs,
-        0,
-        expiryHeight,
-      ]);
+      btn.textContent = "Extending borrower's Tx-A skeleton…";
+      // Prepend lender's input to borrower's skeleton — borrower's input shifts
+      // from index 0 to index 1; their SIGHASH_ALL|ANYONECANPAY signature
+      // remains valid because the hash doesn't include the input index.
+      const extendedHex = prependLenderInput(borrowerSkeleton, exact.txid, exact.outputIndex);
 
-      btn.textContent = "Signing SIGHASH_SINGLE|ANYONECANPAY…";
-      const signed = await rpc("signrawtransaction", [unsignedHex, null, null, "SINGLE|ANYONECANPAY"]);
-      if (!signed.complete) throw new Error("Tx-A sign failed: " + JSON.stringify(signed.errors || {}));
+      btn.textContent = "Signing lender input (SIGHASH_SINGLE|ANYONECANPAY)…";
+      const signedFull = await rpc("signrawtransaction", [extendedHex, null, null, "SINGLE|ANYONECANPAY"]);
+      // signrawtransaction may report incomplete because borrower's input 1
+      // isn't signed by the lender's wallet — but it should NOT touch borrower's
+      // pre-existing scriptSig. Verify input 0 (lender's) is signed.
+      const verifyDecoded = await rpc("decoderawtransaction", [signedFull.hex]);
+      if (!verifyDecoded.vin[0]?.scriptSig?.hex) {
+        throw new Error("lender input 0 still unsigned after signrawtransaction");
+      }
+      if (!verifyDecoded.vin[1]?.scriptSig?.hex) {
+        throw new Error("borrower's pre-signed input 1 was clobbered — extend bug");
+      }
+
+      // Now Tx-A's bytes are complete (both scriptSigs in) → its txid is stable.
+      const txAFinalHex = signedFull.hex;
+      const txATxid = verifyDecoded.txid;
+      btn.textContent = `Tx-A txid stable: ${txATxid.slice(0,16)}… — building Tx-Repay…`;
+
+      // ── Build Tx-Repay ────────────────────────────────────────────────
+      // Input 0: vault UTXO (Tx-A txid, vault_vout)
+      // Output 0: repay amount → lender's R-address (sig-locked by lender)
+      // Lender signs vault input with SIGHASH_SINGLE|ANYONECANPAY (vault-half).
+      // Borrower at accept time adds borrower-half + repayment input + outputs.
+      const repayCcy = principalCcy; // repay is in principal currency by convention
+      const repayAmt = parseFloat(ds.repayAmount);
+      const repayCcyId = repayCcy === "VRSC"
+        ? "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV"
+        : (await rpc("getcurrency", [repayCcy]))?.currencyid;
+      if (!repayCcyId) throw new Error(`could not resolve currency id for ${repayCcy}`);
+      const tipNow = await rpc("getblockcount");
+      const matchExpiry = tipNow + 720;
+      const repayOutputs = repayCcy === "VRSC"
+        ? { [lenderR]: repayAmt }
+        : { [lenderR]: { [repayCcyId]: repayAmt } };
+      const txRepayUnsigned = await rpc("createrawtransaction", [
+        [{ txid: txATxid, vout: vaultVout }],
+        repayOutputs,
+        0,
+        matchExpiry,
+      ]);
+      // Provide prevtxs hint with redeemScript so signrawtransaction can sign
+      // the vault P2SH input.
+      const collateralAmt = parseFloat(ds.collateralAmount);
+      const prevtxsHint = [{
+        txid: txATxid,
+        vout: vaultVout,
+        scriptPubKey: decoded.vout[vaultVout].scriptPubKey.hex,
+        redeemScript: ds.vaultRedeem,
+        amount: collateralAmt,
+      }];
+      const txRepaySigned = await rpc("signrawtransaction", [txRepayUnsigned, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+      // Will be incomplete (only lender vault-half signed) — that's expected.
+      const txRepayPartial = txRepaySigned.hex;
+
+      // ── Build Tx-B ────────────────────────────────────────────────────
+      btn.textContent = "Building Tx-B (default-claim, nLockTime=maturity)…";
+      const termDays = parseInt(ds.termDays || "30", 10);
+      const maturityBlock = tipNow + termDays * 1440;
+      const collateralCcy = ds.collateralCurrency;
+      const collateralCcyId = collateralCcy === "VRSC"
+        ? "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV"
+        : (await rpc("getcurrency", [collateralCcy]))?.currencyid;
+      const txBOutputs = collateralCcy === "VRSC"
+        ? { [lenderR]: collateralAmt }
+        : { [lenderR]: { [collateralCcyId]: collateralAmt } };
+      const txBUnsigned = await rpc("createrawtransaction", [
+        [{ txid: txATxid, vout: vaultVout }],
+        txBOutputs,
+        maturityBlock,             // nLockTime — chain rejects before this block
+        Math.max(maturityBlock + 100, tipNow + 720),  // expiryHeight must be > nLockTime
+      ]);
+      const txBSigned = await rpc("signrawtransaction", [txBUnsigned, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+      const txBPartial = txBSigned.hex;
 
       btn.textContent = "Posting loan.match…";
-      // Build the match payload.
+      // Build the match payload — full Tx-A (both inputs signed) + 2 partials.
       const match = {
-        version: 1,
+        version: 2,
         request: {
           iaddr: ds.requestIaddr,
           txid: ds.requestTxid,
           block: parseInt(ds.requestBlock || "0"),
         },
-        lender_address: lenderR,
-        vault_address: ds.vaultAddress,
+        lender_address:      lenderR,
+        vault_address:       ds.vaultAddress,
         vault_redeem_script: ds.vaultRedeem,
-        tx_a_partial: signed.hex,
-        tx_repay_partial: "",
-        tx_b_partial: "",
-        expires_block: expiryHeight,
+        tx_a_full:           txAFinalHex,         // borrower can broadcast as-is
+        tx_a_txid:           txATxid,
+        vault_vout:          vaultVout,
+        tx_repay_partial:    txRepayPartial,      // needs borrower vault-half + repayment input at repay time
+        tx_b_partial:        txBPartial,          // needs borrower vault-half at accept; lender adds fee input + broadcasts after maturity
+        maturity_block:      maturityBlock,
+        expires_block:       matchExpiry,
         active: true,
       };
       const payloadHex = Array.from(new TextEncoder().encode(JSON.stringify(match)))
@@ -1717,7 +1818,6 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       const existing = (lenderInfoCache.get(acting) || (await rpc("getidentity", [acting])).identity)?.contentmultimap || {};
       const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
       const newMultimap = { ...existing };
-      // Replace any existing match against the same request (idempotent).
       newMultimap[VDXF_LOAN_MATCH] = [payloadHex];
 
       const updateTxid = await rpc("updateidentity", [{
@@ -1725,9 +1825,8 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         parent: ds.actingParent,
         contentmultimap: newMultimap,
       }]);
-      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">✓ Match posted: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(updateTxid)}" target="_blank"><code>${escapeHtml(updateTxid)}</code></a><br>Borrower can now click Accept on this match.</div>`;
+      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">✓ Match posted with all 3 partials: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(updateTxid)}" target="_blank"><code>${escapeHtml(updateTxid)}</code></a><br>Borrower can now click Accept — Tx-A will broadcast and the loan opens self-settling.</div>`;
       btn.style.display = "none";
-      // Bust the marketplace cache so the next loadMarket picks up the new match.
       invalidateMarketCache();
     } catch (e) {
       resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
