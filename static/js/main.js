@@ -1889,6 +1889,24 @@ async function openMarketPostForm(kind) {
   formEl.style.display = "block";
   formEl.dataset.kind = kind;
   await renderActingInfo(me);
+
+  // For the request form, populate the collateral UTXO picker — and refresh
+  // it whenever the borrower changes collateral currency or amount.
+  if (kind === "request") {
+    const b = await balanceFor(me.iaddr);
+    const refresh = () => {
+      const ccy = formEl.querySelector('[data-f="collateral_currency"]')?.value;
+      const amt = parseFloat(formEl.querySelector('[data-f="collateral_amount"]')?.value || "0");
+      if (b.primaryR && ccy && amt > 0) populateCollateralUtxoPicker(formEl, b.primaryR, ccy, amt);
+    };
+    formEl.querySelector('[data-f="collateral_currency"]')?.addEventListener("change", refresh);
+    formEl.querySelector('[data-f="collateral_amount"]')?.addEventListener("input", () => {
+      // Debounce the input so we don't refresh per keystroke.
+      clearTimeout(formEl._utxoRefreshTimer);
+      formEl._utxoRefreshTimer = setTimeout(refresh, 400);
+    });
+    refresh();
+  }
 }
 
 async function renderActingInfo(me) {
@@ -1917,6 +1935,10 @@ function renderRequestFormBody() {
       <label style="flex:1">Currency<select data-f="collateral_currency">${currencyOptions("VRSC")}</select></label>
     </div>
     <div class="row">
+      <label style="flex:1">Collateral UTXO<select data-f="collateral_utxo"><option value="">— pick collateral currency first —</option></select></label>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:-4px">The committed UTXO is what the lender pre-signs settlement against. It locks for ~7 days or until you cancel.</div>
+    <div class="row">
       <label style="flex:1">Repay amount<input type="number" data-f="repay_amount" value="5.05" step="0.01" /></label>
       <label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label>
     </div>
@@ -1927,6 +1949,49 @@ function renderRequestFormBody() {
     </div>
     <div class="preview" style="display:none;margin-top:12px"></div>
   `;
+}
+
+// Populate the collateral UTXO dropdown for the borrower's "Post request"
+// form. Filtered to UTXOs at the borrower's R-address that hold the chosen
+// collateral currency in sufficient quantity.
+async function populateCollateralUtxoPicker(formEl, rAddr, collateralCurrency, collateralAmount) {
+  const sel = formEl.querySelector('[data-f="collateral_utxo"]');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">— loading…</option>';
+  try {
+    const utxos = await rpc("getaddressutxos", [{ addresses: [rAddr], currencynames: true }]);
+    // Resolve the currency name → iaddr lookup so we can match either form.
+    const ccyIaddr = await rpc("getcurrency", [collateralCurrency]).then((c) => c?.currencyid).catch(() => null);
+    const minSats = Math.round((collateralAmount + 0.0001) * 1e8);
+    const usable = utxos.filter((u) => {
+      if (collateralCurrency === "VRSC") {
+        return u.satoshis >= minSats && (!u.currencyvalues || Object.keys(u.currencyvalues).length === 0);
+      }
+      // Non-native currency: match by name OR currency iaddr key
+      const cv = u.currencyvalues || {};
+      const found = Object.entries(cv).find(([k]) => k === collateralCurrency || k === ccyIaddr);
+      return found && parseFloat(found[1]) >= collateralAmount;
+    });
+    if (usable.length === 0) {
+      sel.innerHTML = `<option value="">no ${escapeHtml(collateralCurrency)} UTXO at ${escapeHtml(rAddr)} ≥ ${collateralAmount} (+fee)</option>`;
+      return;
+    }
+    // Sort smallest-first so the UI nudges users to commit the smallest
+    // sufficient UTXO. Avoids accidentally locking 1000 VRSC for a 10 VRSC
+    // collateral commitment.
+    const utxoAmount = (u) => collateralCurrency === "VRSC"
+      ? u.satoshis / 1e8
+      : parseFloat(u.currencyvalues?.[collateralCurrency] ?? u.currencyvalues?.[ccyIaddr] ?? 0);
+    usable.sort((a, b) => utxoAmount(a) - utxoAmount(b));
+    sel.innerHTML = usable.map((u, i) => {
+      const amt = utxoAmount(u);
+      const overcommit = amt > collateralAmount * 5 ? " ⚠ much larger than needed" : "";
+      const badge = i === 0 ? " ✓ best fit" : "";
+      return `<option value="${escapeHtml(u.txid)}:${u.outputIndex}">${escapeHtml(u.txid.slice(0, 16))}…:${u.outputIndex} (${amt.toFixed(8)} ${escapeHtml(collateralCurrency)})${badge}${overcommit}</option>`;
+    }).join("");
+  } catch (e) {
+    sel.innerHTML = `<option value="">error: ${escapeHtml(e.message)}</option>`;
+  }
 }
 
 function renderOfferFormBody() {
@@ -1999,12 +2064,31 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     slug = "loan.request";
     vdxfId = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
     const principalCurrency = f("principal_currency");
+    // v2: commit a specific collateral UTXO + the borrower's pubkey so the
+    // lender can pre-sign all 3 settlement templates at match-post time.
+    const utxoStr = f("collateral_utxo");
+    if (!utxoStr || !utxoStr.includes(":")) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Pick a collateral UTXO before previewing.</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+    const [borrowerInputTxid, borrowerInputVoutStr] = utxoStr.split(":");
+    const rAddr = idInfo.dataset.iaddr ? (await balanceFor(idInfo.dataset.iaddr)).primaryR : null;
+    let borrowerPubkey = null;
+    try { borrowerPubkey = await getPubkeyForRAddress(rAddr); } catch {}
+    if (!borrowerPubkey) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Could not derive borrower pubkey from ${escapeHtml(rAddr || "primary R")} — has this address ever signed a tx?</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
     payload = {
-      version: 1,
+      version: 2,
       principal:  { currency: principalCurrency,        amount: parseFloat(f("principal_amount"))  },
       collateral: { currency: f("collateral_currency"), amount: parseFloat(f("collateral_amount")) },
       repay:      { currency: principalCurrency,        amount: parseFloat(f("repay_amount"))      },
       term_days:  parseInt(f("term_days"), 10),
+      borrower_input:  { txid: borrowerInputTxid, vout: parseInt(borrowerInputVoutStr, 10) },
+      borrower_pubkey: borrowerPubkey,
       active:     true,
     };
   } else if (action === "preview-offer") {
