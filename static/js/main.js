@@ -1720,12 +1720,30 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       if (vaultVout < 0) throw new Error(`vault P2SH ${ds.vaultAddress} not found in borrower's skeleton outputs`);
 
       btn.textContent = "Finding exact-amount UTXO for principal…";
-      // Find or create an exact UTXO for the principal currency.
+      // Find or create an exact UTXO for the principal currency. Prefer
+      // SINGLE-CURRENCY UTXOs: a multi-currency UTXO would dump its
+      // non-principal currencies as Tx-A "fee" because the borrower's
+      // signed skeleton doesn't include outputs for them.
       let utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
-      const findExact = () => utxos.find((u) => {
-        if (principalCcy === "VRSC") return u.satoshis === principalSats;
-        return Object.values(u.currencyvalues || {}).some((v) => parseFloat(v) === principalAmt);
-      });
+      const findExact = () => {
+        // First try: single-currency cryptocondition output of exactly the principal amount.
+        if (principalCcy !== "VRSC") {
+          const single = utxos.find((u) => {
+            const cv = u.currencyvalues || {};
+            const keys = Object.keys(cv);
+            return u.satoshis === 0 && keys.length === 1 && parseFloat(cv[keys[0]]) === principalAmt;
+          });
+          if (single) return single;
+        } else {
+          const single = utxos.find((u) => u.satoshis === principalSats && (!u.currencyvalues || Object.keys(u.currencyvalues).length === 0));
+          if (single) return single;
+        }
+        // Fallback: any UTXO with matching amount in target currency (will leak VRSC if bundled).
+        return utxos.find((u) => {
+          if (principalCcy === "VRSC") return u.satoshis === principalSats;
+          return Object.values(u.currencyvalues || {}).some((v) => parseFloat(v) === principalAmt);
+        });
+      };
       let exact = findExact();
       if (!exact) {
         btn.textContent = "Splitting UTXO via sendcurrency…";
