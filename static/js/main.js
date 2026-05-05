@@ -270,12 +270,19 @@ async function buildAndSignBorrowerTxA({
   collateralCurrency,
   collateralAmount,
   vaultP2sh,
+  utxoAmount,    // optional — when caller already knows the UTXO size (e.g., just split it).
+                 //   Skips a getaddressutxos call (which doesn't see mempool).
 }) {
   const FEE = 0.0001;
-  // Look up the borrower's input UTXO size to compute change.
-  const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
-  const u = utxos.find((x) => x.txid === borrowerInputTxid && x.outputIndex === borrowerInputVout);
-  if (!u) throw new Error(`UTXO ${borrowerInputTxid.slice(0, 16)}…:${borrowerInputVout} not found at ${borrowerR}`);
+  // Look up the borrower's input UTXO size to compute change — only if not provided.
+  if (utxoAmount === undefined) {
+    const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
+    const u = utxos.find((x) => x.txid === borrowerInputTxid && x.outputIndex === borrowerInputVout);
+    if (!u) throw new Error(`UTXO ${borrowerInputTxid.slice(0, 16)}…:${borrowerInputVout} not found at ${borrowerR}`);
+    utxoAmount = collateralCurrency === "VRSC"
+      ? u.satoshis / 1e8
+      : parseFloat(u.currencyvalues?.[collateralCurrency] ?? 0);
+  }
 
   // Resolve currency iaddrs for non-native principal/collateral
   const ccyIaddr = async (name) => {
@@ -287,9 +294,6 @@ async function buildAndSignBorrowerTxA({
   if (!principalCcyId || !collateralCcyId) throw new Error("could not resolve currency ids");
 
   // Borrower's change in the collateral currency (from the same UTXO)
-  const utxoAmount = collateralCurrency === "VRSC"
-    ? u.satoshis / 1e8
-    : parseFloat(u.currencyvalues?.[collateralCurrency] ?? u.currencyvalues?.[collateralCcyId] ?? 0);
   const change = utxoAmount - collateralAmount - FEE;
   if (change < 0) throw new Error(`UTXO too small: have ${utxoAmount} ${collateralCurrency}, need ${collateralAmount + FEE}`);
 
@@ -2613,6 +2617,7 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
         collateralCurrency,
         collateralAmount,
         vaultP2sh: vault.address,
+        utxoAmount: splitAmount,  // we just split this exact amount — skip the lookup
       });
     } catch (e) {
       previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Tx-A build/sign failed: ${escapeHtml(e.message)}</div>`;
