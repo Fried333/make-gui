@@ -1734,6 +1734,10 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       const txATxid = verifyDecoded.txid;
       btn.textContent = `Tx-A txid stable: ${txATxid.slice(0,16)}… — building Tx-Repay…`;
 
+      // Register the 2-of-2 vault on the lender's wallet so signrawtransaction
+      // can attach the lender's vault-half sig on Tx-Repay/Tx-B (idempotent).
+      try { await rpc("addmultisigaddress", [2, [ds.lenderPubkey, ds.borrowerPubkey]]); } catch {}
+
       // ── Build Tx-Repay ────────────────────────────────────────────────
       // Input 0: vault UTXO (Tx-A txid, vault_vout)
       // Output 0: repay amount → lender's R-address (sig-locked by lender)
