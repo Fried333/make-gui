@@ -2769,9 +2769,15 @@ async function loadLoans() {
 
   if (flat.length === 0) {
     const acting = actingIaddr();
+    // Don't wipe the list if a repay/claim op is mid-flight (the empty
+    // state would clobber the active card and detach .repay-result).
+    if (el.querySelector('.mp-row[data-op-active="1"]')) return;
     el.innerHTML = `<div class="empty">No active loans${acting !== "all" ? " for this identity" : " on any local identity"}.</div>`;
     return;
   }
+  // Skip wholesale re-render if any card has an active op panel open —
+  // otherwise the repay handler ends up writing to a detached node.
+  if (el.querySelector('.mp-row[data-op-active="1"]')) return;
   el.innerHTML = flat.map(renderActiveLoan).join("");
 }
 
@@ -2811,6 +2817,8 @@ document.getElementById("loans-list")?.addEventListener("click", async (ev) => {
   if (!btn) return;
   const card = btn.closest(".mp-row");
   const loanId = card.dataset.loanId;
+  // Mark the card so loadLoans / picker-change re-renders can't clobber it.
+  card.dataset.opActive = "1";
   const resultEl = card.querySelector(".repay-result");
 
   if (btn.dataset.loanAct === "repay") {

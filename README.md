@@ -15,8 +15,18 @@ Anyone can fork, extend, or replace it — the chain is the source of truth.
   pulled from the [scan.verus.cx](https://scan.verus.cx) explorer API
 - Lets you post `loan.request` and `loan.offer` entries on any of your
   identities
+- **Borrower-first origination flow** — borrower posts a v2 `loan.request`
+  pre-signed against a fresh single-currency UTXO; lender posts a `loan.match`
+  containing all three pre-signed partials (Tx-A, Tx-Repay, Tx-B); borrower
+  clicks Accept to broadcast Tx-A and open the loan
+- **Active loans tab** — lists open loans on local identities, with a
+  Repay button that auto-splits a clean repayment UTXO, extends Tx-Repay,
+  broadcasts, and posts `loan.history` for credit-score reputation
+- **Auto-split via `sendcurrency`** — no UTXO management; the GUI splits
+  fresh single-currency UTXOs in mempool for clean signing. Chained
+  parent-child broadcasts settle without confirmation waits
 - Cancel button removes entries
-- Active loans + Activity tabs scope to the selected R-address / ID
+- Activity tab — chronological feed of contract events scoped to acting ID
 - Communications tab (placeholder) — will surface encrypted z-memos via
   identity `privateaddress` once Phase C lands
 
@@ -71,17 +81,22 @@ State model:
 
 VDXF ids are deterministic: `verus getvdxfid "vrsc::contract.loan.offer"`.
 
+## End-to-end validation
+
+Full lifecycle (request → match → accept → repay) validated via Playwright
+driving two browser instances against two local daemons on Verus mainnet.
+See `gui_e2e_borrower_first.mjs` in the spec repo for the test driver.
+
 ## What's NOT yet wired
 
-- **Match acceptance / origination** — the "Accept this loan" button
-  shows a preview but doesn't broadcast. Phase C blocker:
-  cross-currency partial-tx flows on cryptocondition currencies
-  (DAI.vETH etc.) need either `makeoffer`/`takeoffer` or
-  `borrower-commits-UTXO` schemes (see SCHEMA.md notes).
+- **Lender's claim-collateral path** — after maturity, the GUI knows
+  Tx-B is in the borrower's `loan.status.tx_b_complete` field but the
+  one-click claim flow on the lender side isn't wired yet. Funds still
+  reachable via cooperative manual sign as a workaround.
 - **Z-memo messaging** — Communications tab is a placeholder. Real
   send/receive against identity `privateaddress` is Phase C+.
-- **Pre-signed Tx-Repay / Tx-B templates** — for cooperative repay and
-  default-after-maturity. Same Phase C territory.
+- **Tx-C rescue path** — the optional last-resort borrower-side
+  recovery (far-future nLockTime) is in the spec but not in the GUI yet.
 
 ## License
 
