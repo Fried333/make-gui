@@ -1864,26 +1864,145 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       }
     } catch {}
     if (req) matchResolvedRequest.set(matchKey, req);
-    const hasPartial = !!(r.tx_a_partial && r.tx_a_partial.length > 50);
+    // v2 match has tx_a_full (full Tx-A, both inputs signed) + Tx-Repay/Tx-B partials.
+    // v1 (legacy) has tx_a_partial only.
+    const isV2 = !!(r.tx_a_full && r.tx_repay_partial && r.tx_b_partial);
+    const hasV1Partial = !isV2 && !!(r.tx_a_partial && r.tx_a_partial.length > 50);
     panel.innerHTML = `
       <div class="review">
         <strong>If you accept this match…</strong>
         <ul style="margin:6px 0 6px 18px;font-size:13px">
-          <li>Lender ${escapeHtml(r.fullyQualifiedName || r.name + "@")} commits <strong>${formatAmount(req?.principal)}</strong> to your address (per pre-signed Tx-A)</li>
+          <li>Lender ${escapeHtml(r.fullyQualifiedName || r.name + "@")} commits <strong>${formatAmount(req?.principal)}</strong> to your address (per Tx-A)</li>
           <li>You commit <strong>${formatAmount(req?.collateral)}</strong> to vault <code>${escapeHtml(r.vault_address)}</code></li>
           <li>You repay <strong>${formatAmount(req?.repay)}</strong> within <strong>${req?.term_days ?? "?"} days</strong></li>
-          <li>Pre-signed Tx-Repay (cooperative) and Tx-B (default-after-maturity) are usable for either path</li>
+          ${isV2 ? `<li>Tx-Repay + Tx-B are pre-signed by lender — you complete the 2-of-2 sigs locally; settlement is unilateral.</li>` : ""}
         </ul>
-        ${hasPartial
-          ? `<button class="primary" data-mp-row-act="accept-broadcast" style="margin-top:6px">Broadcast Tx-A — borrow ${escapeHtml(formatAmount(req?.principal))}</button>
-             <span class="muted" style="font-size:11px;margin-left:8px">Adds your collateral input + vault output to the lender's pre-signed Tx-A and broadcasts.</span>
+        ${isV2
+          ? `<button class="primary" data-mp-row-act="accept-v2" style="margin-top:6px">Accept &amp; broadcast Tx-A</button>
+             <span class="muted" style="font-size:11px;margin-left:8px">Completes 2-of-2 sigs on Tx-Repay/Tx-B, broadcasts Tx-A, posts Tx-B back via loan.status.</span>
              <div class="accept-result" style="margin-top:8px"></div>`
-          : `<strong style="color:var(--warn)">Lender hasn't published a pre-signed Tx-A yet.</strong>
-             <div class="muted" style="font-size:11px;margin-top:4px">
-               This match's <code>tx_a_partial</code> field is empty. Ask the lender to re-post the match after pre-signing their input.
-             </div>`}
+          : hasV1Partial
+            ? `<button class="primary" data-mp-row-act="accept-broadcast" style="margin-top:6px">[v1] Broadcast Tx-A — borrow ${escapeHtml(formatAmount(req?.principal))}</button>
+               <span class="muted" style="font-size:11px;margin-left:8px">Legacy match: extends Tx-A skeleton + adds collateral. Settlement requires later cosig handshake.</span>
+               <div class="accept-result" style="margin-top:8px"></div>`
+            : `<strong style="color:var(--warn)">Match has no pre-signed Tx-A.</strong>
+               <div class="muted" style="font-size:11px;margin-top:4px">
+                 Ask the lender to repost a v2 match.
+               </div>`}
       </div>
     `;
+    return;
+  }
+
+  if (action === "accept-v2") {
+    const matchKey = row.dataset.matchKey;
+    const r = matchByKey.get(matchKey);
+    const panel = row.querySelector(".accept-panel");
+    const resultEl = panel.querySelector(".accept-result") || panel;
+    btn.disabled = true; btn.textContent = "Verifying match…";
+    try {
+      if (!r.tx_a_full || !r.tx_repay_partial || !r.tx_b_partial || !r.vault_address || !r.vault_redeem_script) {
+        throw new Error("v2 match missing required fields (tx_a_full / tx_repay_partial / tx_b_partial / vault_*)");
+      }
+      const acting = actingIaddr();
+      if (!acting || acting === "all") throw new Error("select your borrower identity in the picker first");
+
+      // Decode tx_a_full to verify it makes sense; pull the vault scriptPubKey for prevtxs hint.
+      btn.textContent = "Decoding Tx-A & locating vault output…";
+      const decodedA = await rpc("decoderawtransaction", [r.tx_a_full]);
+      const txATxid = decodedA.txid;
+      const vaultVout = (typeof r.vault_vout === "number")
+        ? r.vault_vout
+        : decodedA.vout.findIndex((o) => (o.scriptPubKey?.addresses || []).includes(r.vault_address));
+      if (vaultVout < 0) throw new Error("vault output not found in Tx-A");
+      const vaultScriptPubKey = decodedA.vout[vaultVout].scriptPubKey.hex;
+
+      // Make sure the borrower's wallet knows about the 2-of-2 vault — required
+      // for signrawtransaction to attach the borrower's vault-half.
+      btn.textContent = "Registering vault address (idempotent)…";
+      // Extract the two pubkeys from the redeemScript: 52 21<33> 21<33> 52 ae
+      const rs = _hexToBytes(r.vault_redeem_script);
+      if (rs.length !== 71 || rs[0] !== 0x52 || rs[1] !== 0x21 || rs[35] !== 0x21 || rs[69] !== 0x52 || rs[70] !== 0xae) {
+        throw new Error("unexpected vault redeemScript shape — only 2-of-2 with two 33-byte compressed pubkeys supported");
+      }
+      const pubA = _bytesToHex(rs.slice(2, 35));
+      const pubB = _bytesToHex(rs.slice(36, 69));
+      try { await rpc("addmultisigaddress", [2, [pubA, pubB]]); } catch {}
+
+      // Build prevtxs hint for the vault input (used by both Tx-Repay and Tx-B sigs).
+      const req = matchResolvedRequest.get(matchKey) || (r.request?.txid ? await fetchRequestFromLocalDaemon(r.request.txid).catch(() => null) : null);
+      if (!req?.collateral?.amount) throw new Error("collateral amount missing — refresh the marketplace and retry");
+      const collateralAmt = parseFloat(req.collateral.amount);
+      const prevtxsHint = [{
+        txid: txATxid,
+        vout: vaultVout,
+        scriptPubKey: vaultScriptPubKey,
+        redeemScript: r.vault_redeem_script,
+        amount: collateralAmt,
+      }];
+
+      // Complete Tx-Repay: borrower adds their vault-half → 2-of-2 done.
+      btn.textContent = "Completing Tx-Repay 2-of-2…";
+      const repaySigned = await rpc("signrawtransaction", [r.tx_repay_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+      if (!repaySigned.complete) throw new Error("Tx-Repay did not complete: " + JSON.stringify(repaySigned.errors || {}));
+
+      // Complete Tx-B similarly.
+      btn.textContent = "Completing Tx-B 2-of-2…";
+      const bSigned = await rpc("signrawtransaction", [r.tx_b_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+      if (!bSigned.complete) throw new Error("Tx-B did not complete: " + JSON.stringify(bSigned.errors || {}));
+
+      // Broadcast Tx-A.
+      btn.textContent = "Broadcasting Tx-A…";
+      const txABroadcastTxid = await rpc("sendrawtransaction", [r.tx_a_full]);
+
+      // Stash Tx-Repay locally (browser localStorage keyed by Tx-A txid).
+      // Will be retrieved later when borrower clicks Repay.
+      try {
+        localStorage.setItem(`vl_tx_repay_${txABroadcastTxid}`, repaySigned.hex);
+      } catch {}
+
+      // Post Tx-B back to chain via loan.status on the borrower's identity so
+      // the lender can find it for the default-claim path.
+      btn.textContent = "Posting Tx-B + loan.status to your VerusID…";
+      const idInfo = await rpc("getidentity", [acting]);
+      const existing = idInfo?.identity?.contentmultimap || {};
+      const VDXF_LOAN_STATUS = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
+      const statusPayload = {
+        version: 2,
+        role: "borrower",
+        loan_id: txABroadcastTxid,
+        match_iaddr: r.match_iaddr,
+        vault_address: r.vault_address,
+        vault_redeem_script: r.vault_redeem_script,
+        principal: req.principal,
+        collateral: req.collateral,
+        repay: req.repay,
+        maturity_block: r.maturity_block,
+        tx_b_complete: bSigned.hex,    // borrower-completed Tx-B for lender's default-claim
+        active: true,
+      };
+      const statusHex = Array.from(new TextEncoder().encode(JSON.stringify(statusPayload)))
+        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const newCm = { ...existing };
+      newCm[VDXF_LOAN_STATUS] = [...(newCm[VDXF_LOAN_STATUS] || []), statusHex];
+      const updateTxid = await rpc("updateidentity", [{
+        name: idInfo.identity.name,
+        parent: idInfo.identity.parent || "",
+        contentmultimap: newCm,
+      }]);
+
+      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">
+        ✓ Loan opened end-to-end:<br>
+        &nbsp;&nbsp;Tx-A: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(txABroadcastTxid)}" target="_blank"><code>${escapeHtml(txABroadcastTxid)}</code></a><br>
+        &nbsp;&nbsp;loan.status: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(updateTxid)}" target="_blank"><code>${escapeHtml(updateTxid.slice(0,16))}…</code></a><br>
+        &nbsp;&nbsp;Tx-Repay stored locally — click Repay anytime to settle.
+      </div>`;
+      btn.style.display = "none";
+    } catch (e) {
+      resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
+      btn.disabled = false;
+      btn.textContent = "Retry";
+    }
     return;
   }
 
