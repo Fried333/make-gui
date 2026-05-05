@@ -1911,6 +1911,22 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       }
     } catch {}
     if (req) matchResolvedRequest.set(matchKey, req);
+    // Explorer strips v2-only fields like tx_a_full. Re-fetch the raw match
+    // multimap entry from the lender's iaddr so we know which UI flow to show.
+    try {
+      const lenderInfo = await rpc("getidentity", [r.match_iaddr]);
+      const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+      const cm = lenderInfo?.identity?.contentmultimap || {};
+      const entries = cm[VDXF_LOAN_MATCH] || [];
+      for (const e of entries) {
+        const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+        if (!hex) continue;
+        try {
+          const json = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+          if (json.request?.iaddr === r.request?.iaddr) { Object.assign(r, json); break; }
+        } catch {}
+      }
+    } catch {}
     // v2 match has tx_a_full (full Tx-A, both inputs signed) + Tx-Repay/Tx-B partials.
     // v1 (legacy) has tx_a_partial only.
     const isV2 = !!(r.tx_a_full && r.tx_repay_partial && r.tx_b_partial);
@@ -1948,6 +1964,26 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const resultEl = panel.querySelector(".accept-result") || panel;
     btn.disabled = true; btn.textContent = "Verifying match…";
     try {
+      // Explorer's typed endpoint strips v2-only fields (e.g., tx_a_full).
+      // Re-fetch the raw multimap entry from the lender's iaddr to get them.
+      try {
+        const lenderInfo = await rpc("getidentity", [r.match_iaddr]);
+        const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+        const cm = lenderInfo?.identity?.contentmultimap || {};
+        const entries = cm[VDXF_LOAN_MATCH] || [];
+        for (const e of entries) {
+          const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+          if (!hex) continue;
+          try {
+            const json = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+            // Match by request reference equality
+            if (json.request?.iaddr === r.request?.iaddr) {
+              Object.assign(r, json);
+              break;
+            }
+          } catch {}
+        }
+      } catch {}
       if (!r.tx_a_full || !r.tx_repay_partial || !r.tx_b_partial || !r.vault_address || !r.vault_redeem_script) {
         throw new Error("v2 match missing required fields (tx_a_full / tx_repay_partial / tx_b_partial / vault_*)");
       }
