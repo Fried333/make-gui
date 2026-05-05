@@ -1726,23 +1726,18 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // signed skeleton doesn't include outputs for them.
       let utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
       const findExact = () => {
-        // First try: single-currency cryptocondition output of exactly the principal amount.
+        // ONLY single-currency UTXOs of exactly the principal amount. A
+        // multi-currency UTXO would dump its non-principal currencies as
+        // "fee" because the borrower's signed skeleton can't accept new
+        // outputs. If no single-currency UTXO exists, we MUST split first.
         if (principalCcy !== "VRSC") {
-          const single = utxos.find((u) => {
+          return utxos.find((u) => {
             const cv = u.currencyvalues || {};
             const keys = Object.keys(cv);
             return u.satoshis === 0 && keys.length === 1 && parseFloat(cv[keys[0]]) === principalAmt;
           });
-          if (single) return single;
-        } else {
-          const single = utxos.find((u) => u.satoshis === principalSats && (!u.currencyvalues || Object.keys(u.currencyvalues).length === 0));
-          if (single) return single;
         }
-        // Fallback: any UTXO with matching amount in target currency (will leak VRSC if bundled).
-        return utxos.find((u) => {
-          if (principalCcy === "VRSC") return u.satoshis === principalSats;
-          return Object.values(u.currencyvalues || {}).some((v) => parseFloat(v) === principalAmt);
-        });
+        return utxos.find((u) => u.satoshis === principalSats && (!u.currencyvalues || Object.keys(u.currencyvalues).length === 0));
       };
       let exact = findExact();
       if (!exact) {
