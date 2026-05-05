@@ -256,6 +256,108 @@ async function fetchRequestFromLocalDaemon(txid) {
   return null;
 }
 
+// Borrower-first Tx-A skeleton builder: constructs Tx-A with borrower's
+// collateral input + 3 outputs (principal → borrower, collateral → vault,
+// change → borrower) and signs the borrower's input only with
+// SIGHASH_ALL|ANYONECANPAY. The lender at match time will add their input
+// (input 0) and sign theirs without invalidating the borrower's signature.
+async function buildAndSignBorrowerTxA({
+  borrowerInputTxid,
+  borrowerInputVout,
+  borrowerR,
+  principalCurrency,
+  principalAmount,
+  collateralCurrency,
+  collateralAmount,
+  vaultP2sh,
+}) {
+  const FEE = 0.0001;
+  // Look up the borrower's input UTXO size to compute change.
+  const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
+  const u = utxos.find((x) => x.txid === borrowerInputTxid && x.outputIndex === borrowerInputVout);
+  if (!u) throw new Error(`UTXO ${borrowerInputTxid.slice(0, 16)}…:${borrowerInputVout} not found at ${borrowerR}`);
+
+  // Resolve currency iaddrs for non-native principal/collateral
+  const ccyIaddr = async (name) => {
+    if (name === "VRSC") return "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV";
+    return (await rpc("getcurrency", [name]))?.currencyid;
+  };
+  const principalCcyId  = await ccyIaddr(principalCurrency);
+  const collateralCcyId = await ccyIaddr(collateralCurrency);
+  if (!principalCcyId || !collateralCcyId) throw new Error("could not resolve currency ids");
+
+  // Borrower's change in the collateral currency (from the same UTXO)
+  const utxoAmount = collateralCurrency === "VRSC"
+    ? u.satoshis / 1e8
+    : parseFloat(u.currencyvalues?.[collateralCurrency] ?? u.currencyvalues?.[collateralCcyId] ?? 0);
+  const change = utxoAmount - collateralAmount - FEE;
+  if (change < 0) throw new Error(`UTXO too small: have ${utxoAmount} ${collateralCurrency}, need ${collateralAmount + FEE}`);
+
+  // Outputs: order matters because lender will SIGHASH_SINGLE|ANYONECANPAY
+  // input 0 → output 0 (principal). So output 0 = principal, output 1 = vault,
+  // output 2 = borrower's change.
+  // (Lender's input 0 is added later — we build with just borrower's input here.)
+  const principalOutputKey = borrowerR;
+  const principalOutputVal = principalCurrency === "VRSC"
+    ? principalAmount
+    : { [principalCcyId]: principalAmount };
+  const vaultOutputVal = collateralCurrency === "VRSC"
+    ? collateralAmount
+    : { [collateralCcyId]: collateralAmount };
+  const changeOutputVal = collateralCurrency === "VRSC"
+    ? change
+    : { [collateralCcyId]: change };
+
+  const tip = await rpc("getblockcount");
+  const expiryHeight = tip + 720; // ~12h
+  // For the placeholder Tx-A skeleton, we include only the borrower's input
+  // and the 3 outputs. The lender's input will be appended later.
+  const outputs = {};
+  outputs[principalOutputKey] = principalOutputVal;
+  outputs[vaultP2sh] = vaultOutputVal;
+  // Two outputs to borrowerR with different values would clash in the
+  // {address: amount} dict. Hack: use the address twice — but createrawtransaction
+  // dict can't represent two outputs to the same address. Workaround: route
+  // change to a different known borrower address, OR consolidate. For now,
+  // require change to go to borrowerR but raise if there's a clash.
+  if (principalOutputKey === borrowerR && change > 0) {
+    // We can't have two outputs to the same R-address via createrawtransaction's
+    // dict-based form. So we use sendmany-style serialization not directly
+    // supported. As a workaround, omit the change output and absorb it into
+    // a higher output. But that's wrong for amount.
+    // Cleanest fix: leave change for the lender to handle by overpaying fee,
+    // but that changes the contract. For now we hand-build the tx with the
+    // raw createrawtransaction "address" key supporting only one entry per
+    // address, so we accept that the borrower's change in collateral currency
+    // won't be sent to borrowerR if the principal also goes there.
+    // BUT — principal goes to borrower in PRINCIPAL currency, change goes
+    // back in COLLATERAL currency. They're DIFFERENT currencies, so the
+    // dict's {borrowerR: principalVal} doesn't conflict with {borrowerR: changeVal}
+    // unless principal and collateral are the same currency.
+    if (principalCurrency === collateralCurrency) {
+      throw new Error("principal and collateral cannot be the same currency in this builder yet");
+    }
+    // Different currencies: merge into one entry as a multi-currency map
+    outputs[borrowerR] = (typeof outputs[borrowerR] === "number")
+      ? { [principalCcyId]: outputs[borrowerR], [collateralCcyId]: change }
+      : { ...outputs[borrowerR], [collateralCcyId]: change };
+  } else if (change > 0) {
+    outputs[borrowerR] = changeOutputVal;
+  }
+
+  const unsignedHex = await rpc("createrawtransaction", [
+    [{ txid: borrowerInputTxid, vout: borrowerInputVout }],
+    outputs,
+    0,
+    expiryHeight,
+  ]);
+
+  // Sign the (only) input with SIGHASH_ALL|ANYONECANPAY
+  const signed = await rpc("signrawtransaction", [unsignedHex, null, null, "ALL|ANYONECANPAY"]);
+  if (!signed.complete) throw new Error("borrower signrawtransaction did not complete: " + JSON.stringify(signed.errors || {}));
+  return signed.hex;
+}
+
 function extendPresignedLoanTxA({ presignedHex, borrowerInputTxid, borrowerInputVout, vaultP2sh, collateralSats, borrowerChangeAddr, borrowerChangeSats }) {
   const tx = _parseTx(presignedHex);
   if (tx.vins.length !== 1 || tx.vouts.length !== 1) {
@@ -1927,6 +2029,10 @@ async function renderActingInfo(me) {
 function renderRequestFormBody() {
   return `
     <div class="row">
+      <label style="flex:1">Lender (their VerusID iaddr or name@)<input type="text" data-f="target_lender" placeholder="i7A9fa8c3xZnA3uLK3SLYa58cUipganewg" /></label>
+    </div>
+    <div class="muted lender-resolve" style="font-size:11px;margin-top:-4px">Paste the lender's VerusID. We'll resolve their pubkey and derive the vault address from it.</div>
+    <div class="row">
       <label style="flex:1">Borrow amount<input type="number" data-f="principal_amount" value="5" step="0.01" /></label>
       <label style="flex:1">Currency<select data-f="principal_currency">${currencyOptions("VRSC")}</select></label>
     </div>
@@ -1937,14 +2043,14 @@ function renderRequestFormBody() {
     <div class="row">
       <label style="flex:1">Collateral UTXO<select data-f="collateral_utxo"><option value="">— pick collateral currency first —</option></select></label>
     </div>
-    <div class="muted" style="font-size:11px;margin-top:-4px">The committed UTXO is what the lender pre-signs settlement against. It locks for ~7 days or until you cancel.</div>
+    <div class="muted" style="font-size:11px;margin-top:-4px">The committed UTXO is what the lender pre-signs settlement against. It locks until the request is matched or you cancel.</div>
     <div class="row">
       <label style="flex:1">Repay amount<input type="number" data-f="repay_amount" value="5.05" step="0.01" /></label>
       <label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label>
     </div>
     <div class="muted" style="font-size:11px;margin-top:4px">Repay is paid in the same currency as the loan.</div>
     <div class="row" style="margin-top:8px;gap:8px">
-      <button class="primary" data-mp-do="preview-request" style="flex:0 0 auto">Preview</button>
+      <button class="primary" data-mp-do="preview-request" style="flex:0 0 auto">Preview &amp; sign</button>
       <button class="ghost"   data-mp-do="cancel" style="flex:0 0 auto">Cancel</button>
     </div>
     <div class="preview" style="display:none;margin-top:12px"></div>
@@ -2064,8 +2170,52 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     slug = "loan.request";
     vdxfId = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
     const principalCurrency = f("principal_currency");
-    // v2: commit a specific collateral UTXO + the borrower's pubkey so the
-    // lender can pre-sign all 3 settlement templates at match-post time.
+    const collateralCurrency = f("collateral_currency");
+    const principalAmount = parseFloat(f("principal_amount"));
+    const collateralAmount = parseFloat(f("collateral_amount"));
+    const repayAmount = parseFloat(f("repay_amount"));
+    const termDays = parseInt(f("term_days"), 10);
+
+    // 1. Resolve target lender — accept iaddr or name@; resolve to iaddr + R + pubkey
+    const lenderInput = (f("target_lender") || "").trim();
+    if (!lenderInput) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Enter the target lender's VerusID before previewing.</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+    let lenderInfo = null;
+    try { lenderInfo = await rpc("getidentity", [lenderInput]); } catch {}
+    if (!lenderInfo?.identity) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Could not resolve lender VerusID "${escapeHtml(lenderInput)}".</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+    const lenderIaddr = lenderInfo.identity.identityaddress || lenderInfo.identity.iaddr;
+    const lenderR = (lenderInfo.identity.primaryaddresses || [])[0];
+    if (!lenderR) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Lender ${escapeHtml(lenderInput)} has no primary R-address.</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+    let lenderPubkey = null;
+    try { lenderPubkey = await getPubkeyForRAddress(lenderR); } catch {}
+    if (!lenderPubkey) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Could not resolve lender pubkey from ${escapeHtml(lenderR)} (need a prior tx signed by them).</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+
+    // 2. Resolve borrower's pubkey + R-address
+    const borrowerR = (await balanceFor(iaddr)).primaryR;
+    let borrowerPubkey = null;
+    try { borrowerPubkey = await getPubkeyForRAddress(borrowerR); } catch {}
+    if (!borrowerPubkey) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Could not resolve borrower pubkey from ${escapeHtml(borrowerR || "primary R")} — sign any tx from this address first.</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+
+    // 3. Pick the collateral UTXO
     const utxoStr = f("collateral_utxo");
     if (!utxoStr || !utxoStr.includes(":")) {
       previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Pick a collateral UTXO before previewing.</div>`;
@@ -2073,22 +2223,47 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       return;
     }
     const [borrowerInputTxid, borrowerInputVoutStr] = utxoStr.split(":");
-    const rAddr = idInfo.dataset.iaddr ? (await balanceFor(idInfo.dataset.iaddr)).primaryR : null;
-    let borrowerPubkey = null;
-    try { borrowerPubkey = await getPubkeyForRAddress(rAddr); } catch {}
-    if (!borrowerPubkey) {
-      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Could not derive borrower pubkey from ${escapeHtml(rAddr || "primary R")} — has this address ever signed a tx?</div>`;
+    const borrowerInputVout = parseInt(borrowerInputVoutStr, 10);
+
+    // 4. Compute vault P2SH from both pubkeys
+    let vault;
+    try {
+      vault = await rpc("createmultisig", [2, [lenderPubkey, borrowerPubkey]]);
+    } catch (e) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Vault derivation failed: ${escapeHtml(e.message)}</div>`;
       previewEl.style.display = "block";
       return;
     }
+
+    // 5. Build Tx-A skeleton (1 input, 3 outputs) and sign borrower's input.
+    //    With SIGHASH_ALL|ANYONECANPAY the lender can later add their input
+    //    without invalidating the borrower's signature.
+    let signedHex;
+    try {
+      signedHex = await buildAndSignBorrowerTxA({
+        borrowerInputTxid,
+        borrowerInputVout,
+        borrowerR,
+        principalCurrency,
+        principalAmount,
+        collateralCurrency,
+        collateralAmount,
+        vaultP2sh: vault.address,
+      });
+    } catch (e) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Tx-A build/sign failed: ${escapeHtml(e.message)}</div>`;
+      previewEl.style.display = "block";
+      return;
+    }
+
     payload = {
       version: 2,
-      principal:  { currency: principalCurrency,        amount: parseFloat(f("principal_amount"))  },
-      collateral: { currency: f("collateral_currency"), amount: parseFloat(f("collateral_amount")) },
-      repay:      { currency: principalCurrency,        amount: parseFloat(f("repay_amount"))      },
-      term_days:  parseInt(f("term_days"), 10),
-      borrower_input:  { txid: borrowerInputTxid, vout: parseInt(borrowerInputVoutStr, 10) },
-      borrower_pubkey: borrowerPubkey,
+      principal:  { currency: principalCurrency,  amount: principalAmount  },
+      collateral: { currency: collateralCurrency, amount: collateralAmount },
+      repay:      { currency: principalCurrency,  amount: repayAmount      },
+      term_days:  termDays,
+      target_lender_iaddr:        lenderIaddr,
+      borrower_input_signed_hex:  signedHex,
       active:     true,
     };
   } else if (action === "preview-offer") {

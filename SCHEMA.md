@@ -130,12 +130,24 @@ A borrower's exact terms: "I want to borrow X, willing to put up Y, will
 repay Z by maturity." No `max_rate` — the borrower pre-states the
 repayment they're willing to honor; the implied rate is `(repay/principal − 1)`.
 
-**v2 (current)** — adds `borrower_input` + `borrower_pubkey` so the lender
-can fully pre-sign all three settlement templates (Tx-A, Tx-Repay, Tx-B) at
-match-post time without any further round-trip with the borrower. Without
-these fields the lender can pre-sign only Tx-A; Tx-Repay and Tx-B require
-knowing the future vault UTXO, which depends on the borrower's collateral
-input and pubkey being committed up front.
+**v2 (current)** — adds the borrower's pre-signed Tx-A input plus the
+target lender. The borrower constructs the full Tx-A skeleton (their input,
+their change output, the principal output going to themselves, and the
+collateral output going to the 2-of-2 vault P2SH derived from both pubkeys)
+and signs their own input with `SIGHASH_ALL|ANYONECANPAY`. The lender can
+then add their own input and pre-sign all three settlement templates (Tx-A,
+Tx-Repay, Tx-B) in one shot at match-post time, then go offline forever.
+
+Required fields:
+- `target_lender_iaddr` — the borrower picked a specific lender to direct
+  this request at; the lender's pubkey is resolved from this iaddr's
+  primary R-address.
+- `borrower_input_signed_hex` — Tx-A skeleton hex with the borrower's
+  input signed `SIGHASH_ALL|ANYONECANPAY`. The hex contains:
+    - 1 input: borrower's collateral UTXO (signed)
+    - 3 outputs: principal → borrower's R, collateral → vault P2SH, change
+  The lender extends by adding input 0 (their principal UTXO) before
+  signing their own portion.
 
 ```json
 {
@@ -144,18 +156,17 @@ input and pubkey being committed up front.
   "collateral": { "currency": "VRSC", "amount": 10 },
   "repay":      { "currency": "DAI",  "amount": 5.05 },
   "term_days":  30,
-  "borrower_input":  { "txid": "e8b58b1e…", "vout": 0 },
-  "borrower_pubkey": "0346…",
-  "target_lender_iaddr": "i...",     // optional — set when posted "from this offer"
+  "target_lender_iaddr":      "i7A9fa…",
+  "borrower_input_signed_hex": "0400008085202f8901…",
   "active":     true
 }
 ```
 
-**v1 (legacy)** — same shape minus the three new fields. Indexers and
-GUIs should still read v1 entries (older requests on chain remain valid),
-but lenders cannot pre-sign Tx-Repay/Tx-B against v1 requests; matches
-posted against v1 will have empty `tx_repay_partial` / `tx_b_partial`
-and require a follow-up cooperative signing ceremony to settle.
+**v1 (legacy)** — terms only, no UTXO commitment, no signed input. Indexers
+and GUIs should still read v1 entries (older requests on chain remain valid),
+but matches against v1 requests can't be fully pre-signed — they need a
+cooperative cosigning handshake at accept time, which is an older flow not
+maintained here.
 
 ### `contract.loan.match` — lender pre-signs a funding offer
 
