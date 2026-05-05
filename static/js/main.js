@@ -2385,12 +2385,17 @@ async function populateCollateralUtxoPicker(formEl, rAddr, collateralCurrency, c
     const minSats = Math.round((collateralAmount + 0.0001) * 1e8);
     const usable = utxos.filter((u) => {
       if (collateralCurrency === "VRSC") {
+        // Pure VRSC UTXO (P2PKH with no currencyvalues, or zero-VRSC sats with empty cv).
         return u.satoshis >= minSats && (!u.currencyvalues || Object.keys(u.currencyvalues).length === 0);
       }
-      // Non-native currency: match by name OR currency iaddr key
+      // Non-native: SINGLE-currency UTXO with no bundled VRSC (sats=0) and exactly one cv entry.
+      // A multi-currency UTXO would dump its non-collateral currencies as Tx-A "fee".
       const cv = u.currencyvalues || {};
-      const found = Object.entries(cv).find(([k]) => k === collateralCurrency || k === ccyIaddr);
-      return found && parseFloat(found[1]) >= collateralAmount;
+      const keys = Object.keys(cv);
+      if (u.satoshis !== 0 || keys.length !== 1) return false;
+      const key = keys[0];
+      if (key !== collateralCurrency && key !== ccyIaddr) return false;
+      return parseFloat(cv[key]) >= collateralAmount;
     });
     if (usable.length === 0) {
       sel.innerHTML = `<option value="">no ${escapeHtml(collateralCurrency)} UTXO at ${escapeHtml(rAddr)} ≥ ${collateralAmount} (+fee)</option>`;
