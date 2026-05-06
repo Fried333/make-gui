@@ -2477,6 +2477,9 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
       btn.disabled = false;
       btn.textContent = "Retry";
+      // Release the op-active guard so balance checks + other rows can refresh.
+      const panel = row.querySelector(".post-match-panel");
+      if (panel) delete panel.dataset.opActive;
     }
     return;
   }
@@ -2742,6 +2745,12 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
       btn.disabled = false;
       btn.textContent = "Retry";
+      // Release the op-active guard so other rows + balance checks can
+      // refresh. The panel stays visible with the error + Retry button;
+      // a subsequent loadMarket may re-render the row, but the user
+      // can re-trigger Accept normally.
+      const panel = row.querySelector(".accept-panel");
+      if (panel) delete panel.dataset.opActive;
     }
     return;
   }
