@@ -2891,14 +2891,39 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         amount: collateralAmt,
       }];
 
+      // For v4 vault keys (and any imported, non-default-keyed key), the
+      // wallet has the privkey but signrawtransaction's auto-discover
+      // doesn't pick it up for multisig P2SH. Pass the privkey explicitly.
+      // We derive it deterministically from R_priv + borrower_input_txid
+      // (the same tweak the borrower's preview-request flow used) — works
+      // even after a wallet restore from R-priv only.
+      let extraSigningKeys = null;
+      if ((req?.version ?? 0) >= 4 && req.borrower_input_txid && req.borrower_vault_pubkey) {
+        try {
+          const tk = await import('./tweaked-key.js');
+          const borrowerR = (await balanceFor(acting)).primaryR;
+          const rWif = await rpc("dumpprivkey", [borrowerR]);
+          const rDec = await tk.wifDecode(rWif);
+          const rPub = tk.pubkeyFromPriv(rDec.priv);
+          const vaultPriv32 = await tk.tweakedPriv(rDec.priv, rPub, req.borrower_input_txid);
+          const derivedPub = tk.pubkeyFromPriv(vaultPriv32);
+          if (derivedPub !== req.borrower_vault_pubkey) {
+            throw new Error(`tweaked vault pubkey mismatch: derived ${derivedPub} != request ${req.borrower_vault_pubkey}`);
+          }
+          extraSigningKeys = [await tk.wifEncode(vaultPriv32, true)];
+        } catch (e) {
+          throw new Error(`v4 vault key derivation failed: ${e.message}`);
+        }
+      }
+
       // Complete Tx-Repay: borrower adds their vault-half → 2-of-2 done.
       btn.textContent = "Completing Tx-Repay 2-of-2…";
-      const repaySigned = await rpc("signrawtransaction", [r.tx_repay_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+      const repaySigned = await rpc("signrawtransaction", [r.tx_repay_partial, prevtxsHint, extraSigningKeys, "SINGLE|ANYONECANPAY"]);
       if (!repaySigned.complete) throw new Error("Tx-Repay did not complete: " + JSON.stringify(repaySigned.errors || {}));
 
       // Complete Tx-B similarly.
       btn.textContent = "Completing Tx-B 2-of-2…";
-      const bSigned = await rpc("signrawtransaction", [r.tx_b_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+      const bSigned = await rpc("signrawtransaction", [r.tx_b_partial, prevtxsHint, extraSigningKeys, "SINGLE|ANYONECANPAY"]);
       if (!bSigned.complete) throw new Error("Tx-B did not complete: " + JSON.stringify(bSigned.errors || {}));
 
       // Broadcast Tx-A.
@@ -2918,7 +2943,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       const existing = idInfo?.identity?.contentmultimap || {};
       const VDXF_LOAN_STATUS = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j";
       const statusPayload = {
-        version: 3,
+        version: 4,
         role: "borrower",
         loan_id: txABroadcastTxid,
         // v3: propagate the request's txid as the loan's canonical
@@ -2932,7 +2957,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         principal: req.principal,
         collateral: req.collateral,
         repay: req.repay,
+        term_days: req.term_days ?? null,
         maturity_block: r.maturity_block,
+        // v4: persist the borrower_input_txid (the salt for the per-loan
+        // vault key tweak) so repay/claim flows can re-derive the vault
+        // privkey from R_priv alone — even after a wallet restore.
+        borrower_input_txid: req.borrower_input_txid ?? null,
+        borrower_vault_pubkey: req.borrower_vault_pubkey ?? null,
         tx_b_complete: bSigned.hex,       // borrower-completed Tx-B for lender's default-claim
         // Borrower-half-signed Tx-Repay (lender's vault-half from match +
         // borrower's vault-half added). Stored on the borrower's own
@@ -4350,7 +4381,31 @@ async function enrichActiveLoanBalances() {
           redeemScript: matchPayload.vault_redeem_script,
           amount: parseFloat(status.collateral?.amount ?? vaultOut.value),
         }];
-        const repaySigned = await rpc("signrawtransaction", [matchPayload.tx_repay_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
+        // For v4 vault keys, signrawtransaction's auto-discover doesn't
+        // pick up the imported tweaked privkey for multisig P2SH. Pass it
+        // explicitly. Re-derive deterministically from R_priv + the
+        // borrower_input_txid recorded on the original loan.request — works
+        // even after a wallet restore from R-priv only.
+        let extraSigningKeys = null;
+        if (status?.borrower_input_txid || status?.version >= 4) {
+          // Try to resolve the original request to read borrower_input_txid
+          let inputTxid = status.borrower_input_txid;
+          if (!inputTxid && status.request_txid) {
+            const reqHist = await fetchRequestFromLocalDaemon(status.request_txid).catch(() => null);
+            inputTxid = reqHist?.borrower_input_txid;
+          }
+          if (inputTxid) {
+            try {
+              const tk = await import('./tweaked-key.js');
+              const rWif = await rpc("dumpprivkey", [(idInfo.identity.primaryaddresses || [])[0]]);
+              const rDec = await tk.wifDecode(rWif);
+              const rPub = tk.pubkeyFromPriv(rDec.priv);
+              const vaultPriv32 = await tk.tweakedPriv(rDec.priv, rPub, inputTxid);
+              extraSigningKeys = [await tk.wifEncode(vaultPriv32, true)];
+            } catch (e) { console.warn("v4 vault key derivation in repay-recovery:", e.message); }
+          }
+        }
+        const repaySigned = await rpc("signrawtransaction", [matchPayload.tx_repay_partial, prevtxsHint, extraSigningKeys, "SINGLE|ANYONECANPAY"]);
         if (!repaySigned.complete) throw new Error("Tx-Repay vault-half re-sign incomplete: " + JSON.stringify(repaySigned.errors || {}));
         txRepayHex = repaySigned.hex;
         try { localStorage.setItem(`vl_tx_repay_${loanId}`, txRepayHex); } catch {}
