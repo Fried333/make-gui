@@ -120,7 +120,8 @@ h2 { font-size: 18px; margin: 0 0 16px 0; font-weight: 600; }
 .mp-tab:hover { color: var(--fg); }
 .mp-tab.active { background: rgba(88,166,255,0.1); color: var(--accent); border-color: var(--accent); }
 
-button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled,
+button:disabled:hover { opacity: 0.4; cursor: not-allowed; }
 
 .post-box {
   background: rgba(0,0,0,0.2);
