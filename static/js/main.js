@@ -4332,12 +4332,12 @@ async function enrichActiveLoanBalances() {
       btn.textContent = "Posting loan.history (settled)…";
       const VDXF_LOAN_HISTORY = "iBGuPDeeHHYpvKdM7VG2d7LR1Lct9itcpT";
       const historyPayload = {
-        version: 2,
+        version: 3,
         role: "borrower",
         loan_id: loanId,
-        // v2: propagate request_txid (read from the local loan.status
-        // entry that was posted at accept time) so the canonical loan
-        // join works on this entry too.
+        // Propagate request_txid (read from the local loan.status entry
+        // posted at accept time) so the canonical loan join works on
+        // this entry alone — even after loan.status is cleaned up.
         request_txid: status.request_txid ?? null,
         outcome: "repaid",
         tx_repay_txid: repayBroadcastTxid,
@@ -4345,6 +4345,13 @@ async function enrichActiveLoanBalances() {
         principal: status.principal,
         collateral: status.collateral,
         repay: status.repay,
+        // v3: carry term_days + maturity_block forward so the explorer's
+        // tx detail page can render "over X days" / due date without
+        // depending on a still-present loan.status (which gets cleaned
+        // up after settlement).
+        term_days: status.term_days ?? null,
+        maturity_block: status.maturity_block ?? null,
+        posted_block: status.posted_block ?? status.originated_block ?? null,
         counterparty_iaddr: status.match_iaddr,
       };
       const historyHex = Array.from(new TextEncoder().encode(JSON.stringify(historyPayload)))
