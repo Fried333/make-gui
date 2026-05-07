@@ -105,6 +105,12 @@ class Handler(BaseHTTPRequestHandler):
         "sendcurrency", "z_getoperationresult", "z_getoperationstatus",
         "updateidentity", "signmessage",
         "lockunspent", "listlockunspent",
+        # Per-loan vault key derivation (option C tweaked-key). dumpprivkey
+        # is the only way to get the R-priv to compute vault_priv = R_priv +
+        # tweak; importprivkey installs the derived key so signrawtransaction
+        # can use it on later vault-spending flows. Both are read/write to
+        # wallet privkeys — sensitive, but already gated by CSRF + same-origin.
+        "dumpprivkey", "importprivkey",
     }
 
     def _security_headers(self):
