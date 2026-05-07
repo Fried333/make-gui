@@ -846,11 +846,39 @@ function mpTabToLegacy(tab) {
   }
 }
 
+// History tab filters (state + role). Persisted in localStorage so the
+// user's preferred slice survives reloads.
+const LS_KEY_HISTORY_FILTER = "vl_history_filter";
+const LS_KEY_HISTORY_ROLE   = "vl_history_role";
+let historyFilter = localStorage.getItem(LS_KEY_HISTORY_FILTER) || "all";
+let historyRole   = localStorage.getItem(LS_KEY_HISTORY_ROLE)   || "all";
+
+function applyHistoryFilterUi() {
+  document.querySelectorAll('[data-history-filter]').forEach((b) => {
+    b.classList.toggle("active", b.dataset.historyFilter === historyFilter);
+  });
+  document.querySelectorAll('[data-history-role]').forEach((b) => {
+    b.classList.toggle("active", b.dataset.historyRole === historyRole);
+  });
+}
+applyHistoryFilterUi();
+
+// Hide marketplace-only toggles on tabs where they don't apply, and toggle
+// History's filter row visibility.
+function syncSubControls() {
+  const showStaleWrap = document.getElementById("mp-show-stale-wrap");
+  const histRow       = document.getElementById("history-filter-row");
+  if (showStaleWrap) showStaleWrap.style.display = (mpTab === "market") ? "flex" : "none";
+  if (histRow)       histRow.style.display       = (mpTab === "history") ? "flex" : "none";
+}
+syncSubControls();
+
 document.querySelectorAll('#market [data-mp-tab]').forEach((b) => {
   b.onclick = () => {
     document.querySelectorAll('#market [data-mp-tab]').forEach((x) => x.classList.remove("active"));
     b.classList.add("active");
     mpTab = b.dataset.mpTab;
+    syncSubControls();
     // Clear any in-flight op markers from the previous tab — those guard
     // against re-render clobbering an active panel, but tab switches are
     // explicit user navigation, so the guard shouldn't apply.
@@ -863,7 +891,24 @@ document.querySelectorAll('#market [data-mp-tab]').forEach((b) => {
   };
 });
 
-// "Show stale" toggle — persist + reload on change.
+document.querySelectorAll('[data-history-filter]').forEach((b) => {
+  b.onclick = () => {
+    historyFilter = b.dataset.historyFilter;
+    localStorage.setItem(LS_KEY_HISTORY_FILTER, historyFilter);
+    applyHistoryFilterUi();
+    if (mpTab === "history") loadMarket();
+  };
+});
+document.querySelectorAll('[data-history-role]').forEach((b) => {
+  b.onclick = () => {
+    historyRole = b.dataset.historyRole;
+    localStorage.setItem(LS_KEY_HISTORY_ROLE, historyRole);
+    applyHistoryFilterUi();
+    if (mpTab === "history") loadMarket();
+  };
+});
+
+// "Show stale" toggle (Marketplace only) — persist + reload on change.
 const LS_KEY_SHOW_STALE = "vl_show_stale";
 const showStaleEl = document.getElementById("mp-show-stale");
 if (showStaleEl) {
@@ -1857,10 +1902,21 @@ function renderMarketOffer(r, mySet, myMap, acting) {
   const mine = mySet.has(r.iaddr);
   const isActing = acting && acting !== "all" && r.iaddr === acting;
   const me = myMap.get(r.iaddr);
+  // Pre-fill values for "Post request to this lender" — borrower's form
+  // honors target_lender + a starting principal/collateral guess pulled
+  // from the offer's terms (max_principal as ceiling, min_collateral_ratio
+  // as the principal→collateral multiplier).
+  const prefillName = r.fullyQualifiedName || (r.name ? r.name + "@" : r.iaddr);
   return `
-    <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iA1vgVBV5B29h5pxQ67gxqCoEaLDZ8WbmY">
+    <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iA1vgVBV5B29h5pxQ67gxqCoEaLDZ8WbmY"
+         data-offer-fqn="${escapeHtml(prefillName)}"
+         data-offer-rate="${r.rate ?? ""}" data-offer-term="${r.term_days ?? ""}"
+         data-offer-max-principal="${(r.max_principal && r.max_principal.amount) || ""}"
+         data-offer-principal-ccy="${escapeHtml((r.max_principal && r.max_principal.currency) || "")}"
+         data-offer-min-ratio="${r.min_collateral_ratio ?? ""}"
+         data-offer-collaterals="${escapeHtml((r.accepted_collateral || []).join(","))}">
       <div class="row">
-        <strong style="flex:1">${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
+        <strong style="flex:1">${escapeHtml(prefillName)}</strong>
         <span class="badge loan-offer">Loan offer</span>
         ${isActing ? `<span class="badge yours" style="margin-left:6px">yours</span>` : mine ? `<span class="badge muted" style="margin-left:6px">local</span>` : ""}
       </div>
@@ -1871,7 +1927,9 @@ function renderMarketOffer(r, mySet, myMap, acting) {
         <div><span class="k">rate</span><span class="v">${r.rate != null ? (r.rate * 100).toFixed(1) + "%" : "?"}</span></div>
         <div><span class="k">term</span><span class="v">${escapeHtml(r.term_days ?? "?")} days</span></div>
       </div>
-      ${mine ? `<div class="row" style="margin-top:10px"><button class="ghost remove-btn" data-mp-row-act="cancel" style="flex:0 0 auto">Cancel offer</button></div>` : ""}
+      ${mine
+        ? `<div class="row" style="margin-top:10px"><button class="ghost remove-btn" data-mp-row-act="cancel" style="flex:0 0 auto">Cancel offer</button></div>`
+        : `<div class="row" style="margin-top:10px"><button class="primary" data-mp-row-act="post-request-to-lender" style="flex:0 0 auto">Post request to this lender</button></div>`}
     </div>
   `;
 }
@@ -2126,6 +2184,35 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
   if (!btn) return;
   const action = btn.dataset.mpRowAct;
   const row = btn.closest(".mp-row");
+
+  if (action === "post-request-to-lender") {
+    // Open the marketplace request form, pre-filled with this offer's
+    // lender iaddr + sensible defaults pulled from the offer terms.
+    ev.stopPropagation();
+    const lenderIa = row.dataset.iaddr;
+    const offerCcy = row.dataset.offerPrincipalCcy || "VRSC";
+    const offerMaxAmt = parseFloat(row.dataset.offerMaxPrincipal || "5") || 5;
+    const offerRatio  = parseFloat(row.dataset.offerMinRatio || "2") || 2;
+    const offerTerm   = parseInt(row.dataset.offerTerm || "30") || 30;
+    const offerRate   = parseFloat(row.dataset.offerRate || "0.01");
+    const offerCols   = (row.dataset.offerCollaterals || "").split(",").filter(Boolean);
+    const principal = Math.min(offerMaxAmt, 5);                  // start small by default
+    const collateralCcy = offerCols[0] || "VRSC";
+    const collateral = +(principal * offerRatio).toFixed(8);
+    const repay = +(principal * (1 + offerRate * (offerTerm / 365))).toFixed(8);
+    await openMarketPostForm("request", {
+      target_lender: lenderIa,
+      target_lender_label: row.dataset.offerFqn || lenderIa,
+      principal_amount: principal,
+      principal_currency: offerCcy,
+      collateral_amount: collateral,
+      collateral_currency: collateralCcy,
+      repay_amount: repay,
+      term_days: offerTerm,
+      min_collateral_ratio: offerRatio,  // form validation gates Preview on collateral/principal ≥ this
+    });
+    return;
+  }
 
   if (action === "toggle-raw") {
     const panel = row.querySelector(".raw-panel");
@@ -3093,7 +3180,7 @@ function fmtBalances(bal, currencyMap = {}) {
   return items.length ? items.join(" · ") : "—";
 }
 
-async function openMarketPostForm(kind) {
+async function openMarketPostForm(kind, prefill) {
   const formEl = document.getElementById("mp-post-form");
   const ids = await ensureSpendableIds();
   if (ids.length === 0) {
@@ -3116,7 +3203,7 @@ async function openMarketPostForm(kind) {
   const inner = kind === "request" ? renderRequestFormBody() : renderOfferFormBody();
   formEl.innerHTML = `
     <div class="card post-box">
-      <h3>${kind === "request" ? "Post a loan request" : "Post a loan offer"} from ${escapeHtml(me.fqn)}</h3>
+      <h3>${kind === "request" ? "Post a loan request" : "Post a loan offer"} from ${escapeHtml(me.fqn)}${prefill?.target_lender_label ? ` &rarr; ${escapeHtml(prefill.target_lender_label)}` : ""}</h3>
       <div id="mp-id-info" class="muted" style="font-size:12px;margin-bottom:10px">fetching balance…</div>
       ${inner}
     </div>
@@ -3125,7 +3212,26 @@ async function openMarketPostForm(kind) {
   formEl.dataset.kind = kind;
   await renderActingInfo(me);
 
-  // Option A: no collateral UTXO picker — split happens at preview-request time.
+  // Apply prefill (e.g. clicked "Post request to this lender" on a
+  // marketplace offer). Each field is a data-f attribute on an input/select.
+  if (prefill) {
+    const setVal = (selector, val) => {
+      const el = formEl.querySelector(selector);
+      if (el && val != null && val !== "") el.value = String(val);
+    };
+    setVal('[data-f="target_lender"]',       prefill.target_lender);
+    setVal('[data-f="principal_amount"]',    prefill.principal_amount);
+    setVal('[data-f="principal_currency"]',  prefill.principal_currency);
+    setVal('[data-f="collateral_amount"]',   prefill.collateral_amount);
+    setVal('[data-f="collateral_currency"]', prefill.collateral_currency);
+    setVal('[data-f="repay_amount"]',        prefill.repay_amount);
+    setVal('[data-f="term_days"]',           prefill.term_days);
+    if (prefill.min_collateral_ratio != null) {
+      formEl.dataset.minCollateralRatio = String(prefill.min_collateral_ratio);
+    }
+    formEl.scrollIntoView({ behavior: "smooth", block: "start" });
+    runFormValidation(formEl);
+  }
 }
 
 async function renderActingInfo(me) {
@@ -3135,12 +3241,147 @@ async function renderActingInfo(me) {
   info.innerHTML = `
     i-address: <code>${escapeHtml(me.iaddr)}</code><br>
     primary R: <code>${escapeHtml(b.primaryR || "—")}</code><br>
-    R-address balance: ${fmtBalances(b.rBalance)}<br>
+    R-address balance: <span class="r-balance-line">${fmtBalances(b.rBalance)}</span><br>
     i-address balance: ${fmtBalances(b.iaddrBalance)}
+    <div class="form-validation" style="margin-top:8px;font-size:12px;line-height:1.6"></div>
   `;
   info.dataset.iaddr = me.iaddr;
   info.dataset.name = me.name;
   info.dataset.parent = me.parent || "";
+  info.dataset.rBalance  = JSON.stringify(b.rBalance || {});
+  info.dataset.primaryR  = b.primaryR || "";
+  // Run validation now + after every form input change.
+  const formEl = document.getElementById("mp-post-form");
+  if (formEl) {
+    runFormValidation(formEl);
+    formEl.addEventListener("input", () => runFormValidation(formEl));
+    formEl.addEventListener("change", () => runFormValidation(formEl));
+  }
+}
+
+// Map currency names → their canonical iaddr key in getaddressbalance results.
+const CURRENCY_NAME_TO_IADDR = {
+  "VRSC":     "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV",
+  "DAI.vETH": "iGBs4DWztRNvNEJBt4mqHszLxfKTNHTkhM",
+  "vETH":     "iCkKJuJScy4Z6NSDK7Mt42ZAB2NEnAE1o4",
+  "CHIPS":    "iJ3WZocnjG9ufv7GKUA4LijQno5gTMb7tP",
+};
+function _balanceForCurrency(rBalance, currencyName) {
+  if (!rBalance) return 0;
+  // rBalance keys are i-addresses; map back via CURRENCY_NAME_TO_IADDR.
+  const iaddrKey = CURRENCY_NAME_TO_IADDR[currencyName];
+  if (iaddrKey != null && rBalance[iaddrKey] != null) return parseFloat(rBalance[iaddrKey]);
+  // Fallback: maybe the key is already the name.
+  if (rBalance[currencyName] != null) return parseFloat(rBalance[currencyName]);
+  return 0;
+}
+
+// Form validation runs on every input change. Three checks per form:
+//  1. Borrower has enough of the COLLATERAL currency on their R-address
+//     (collateralAmount + 0.0002 fee budget). Renders green / red inline.
+//  2. If the form was opened from a marketplace lender offer (the offer's
+//     `min_collateral_ratio` was prefilled), verify
+//     collateralAmount / principalAmount ≥ min_ratio. Inline error if not.
+//  3. Highlight the R-address balance line green/red so it's scannable.
+function runFormValidation(formEl) {
+  const out  = formEl.querySelector(".form-validation");
+  const balLine = formEl.querySelector(".r-balance-line");
+  if (!out) return;
+
+  const principalAmt = parseFloat(formEl.querySelector('[data-f="principal_amount"]')?.value || "0");
+  const collAmt      = parseFloat(formEl.querySelector('[data-f="collateral_amount"]')?.value || "0");
+  const collCcy      = formEl.querySelector('[data-f="collateral_currency"]')?.value || "VRSC";
+  const minRatio     = parseFloat(formEl.dataset.minCollateralRatio || "0");
+  const info = document.getElementById("mp-id-info");
+  let rBalance = {};
+  try { rBalance = JSON.parse(info?.dataset?.rBalance || "{}"); } catch {}
+
+  const have = _balanceForCurrency(rBalance, collCcy);
+  const needCollateral = collAmt + 0.0002; // +fee budget for the auto-split
+  const collOk = have >= needCollateral;
+
+  const messages = [];
+  // Check 1: balance for collateral
+  messages.push(collOk
+    ? `<span style="color:var(--ok)">✓ enough ${escapeHtml(collCcy)} on R for collateral</span> <span class="muted">(have ${have.toFixed(8)}, need ${needCollateral.toFixed(4)})</span>`
+    : `<span style="color:var(--bad)">✗ insufficient ${escapeHtml(collCcy)} on R</span> <span class="muted">(have ${have.toFixed(8)}, need ${needCollateral.toFixed(4)})</span>`
+  );
+  // Check 2: collateral ratio (only if form was prefilled with an offer)
+  if (minRatio > 0 && principalAmt > 0) {
+    const ratio = collAmt / principalAmt;
+    const ratioOk = ratio >= minRatio - 1e-9;
+    messages.push(ratioOk
+      ? `<span style="color:var(--ok)">✓ collateral ratio ${ratio.toFixed(2)}× ≥ lender's ${minRatio.toFixed(2)}×</span>`
+      : `<span style="color:var(--bad)">✗ collateral ratio ${ratio.toFixed(2)}× &lt; lender's required ${minRatio.toFixed(2)}×</span>`
+    );
+  }
+  out.innerHTML = messages.join("<br>");
+
+  // Color the R-balance line based on the collateral check.
+  if (balLine) balLine.style.color = collOk ? "var(--ok)" : "var(--bad)";
+
+  // Disable Preview & sign on hard-fail (insufficient balance OR ratio under).
+  const preview = formEl.querySelector('[data-mp-do="preview-request"]');
+  const ratioFail = (minRatio > 0 && principalAmt > 0 && (collAmt / principalAmt) < minRatio - 1e-9);
+  if (preview) {
+    preview.disabled = !collOk || ratioFail;
+    preview.title = !collOk ? "Insufficient collateral balance"
+                  : ratioFail ? "Collateral ratio below lender's minimum"
+                  : "";
+  }
+}
+
+// Smart UTXO reuse: scan the wallet's locked UTXOs for one at borrowerR
+// that matches the requested currency + amount AND isn't already
+// referenced by an active loan.request (i.e. the original request was
+// cancelled / dropped, leaving the lock orphaned). Returns
+// { txid, vout, amount } or null. Eliminates stranded lockunspent
+// reservations across cancel/repost cycles.
+async function findReusableSplitUtxo(iaddr, borrowerR, currency, splitAmount) {
+  const locked = await rpc("listlockunspent", []).catch(() => []);
+  if (!Array.isArray(locked) || locked.length === 0) return null;
+
+  // Build set of (txid:vout) pairs used by current active loan.requests.
+  const inUse = new Set();
+  const myInfo = await rpc("getidentity", [iaddr, -1]).catch(() => null);
+  const myCm = myInfo?.identity?.contentmultimap || {};
+  for (const k of VDXF_LOAN_REQUEST_KEYS) {
+    for (const e of (myCm[k] || [])) {
+      const payload = decodeMultimapEntry(e);
+      const hex = payload?.borrower_input_signed_hex;
+      if (!hex) continue;
+      try {
+        const dec = await rpc("decoderawtransaction", [hex]);
+        const vin = dec?.vin?.[0];
+        if (vin?.txid) inUse.add(`${vin.txid}:${vin.vout}`);
+      } catch {}
+    }
+  }
+
+  for (const u of locked) {
+    const key = `${u.txid}:${u.vout}`;
+    if (inUse.has(key)) continue; // still bound to a live request
+    const tx = await rpc("getrawtransaction", [u.txid, 1]).catch(() => null);
+    const out = tx?.vout?.[u.vout];
+    if (!out) continue;
+    const addrs = out.scriptPubKey?.addresses || [];
+    if (!addrs.includes(borrowerR)) continue;
+    const cv = out.scriptPubKey?.reserveoutput?.currencyvalues || {};
+    const cvKeys = Object.keys(cv);
+    if (currency === "VRSC") {
+      if (cvKeys.length === 0 && Math.abs((out.value || 0) - splitAmount) < 1e-7) {
+        return { txid: u.txid, vout: u.vout, amount: out.value };
+      }
+    } else {
+      // Non-native: single-currency UTXO with no bundled VRSC.
+      const expectedKeys = [currency, CURRENCY_NAME_TO_IADDR[currency]].filter(Boolean);
+      if ((out.valueSat ?? Math.round(out.value * 1e8)) === 0 && cvKeys.length === 1 && expectedKeys.includes(cvKeys[0])) {
+        const amt = parseFloat(Object.values(cv)[0]);
+        if (Math.abs(amt - splitAmount) < 1e-7) return { txid: u.txid, vout: u.vout, amount: amt };
+      }
+    }
+  }
+  return null;
 }
 
 function renderRequestFormBody() {
@@ -3348,61 +3589,70 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       return;
     }
 
-    // 3. Option A: auto-split a fresh clean collateral UTXO via sendcurrency.
-    //    Sends `collateralAmount + 0.0001` to borrower's R, gets a single-currency
-    //    UTXO in mempool, uses it immediately (no confirmation wait — Verus
-    //    supports chained mempool).
-    previewEl.innerHTML = `<div class="review muted">Splitting a fresh ${collateralCurrency} UTXO via sendcurrency…</div>`;
-    previewEl.style.display = "block";
-    const splitAmount = collateralAmount + 0.0001;  // collateral + Tx-A fee budget
-    let splitTxid;
-    try {
-      const out = collateralCurrency === "VRSC"
-        ? [{ address: borrowerR, amount: splitAmount }]
-        : [{ currency: collateralCurrency, amount: splitAmount, address: borrowerR }];
-      const opid = await rpc("sendcurrency", [borrowerR, out]);
-      for (let i = 0; i < 30 && !splitTxid; i++) {
-        await new Promise((res) => setTimeout(res, 2000));
-        const r = await rpc("z_getoperationresult", [[opid]]);
-        const op = (r || [])[0];
-        if (op?.status === "success") splitTxid = op.result?.txid;
-        if (op?.status === "failed") throw new Error("split sendcurrency failed: " + JSON.stringify(op.error || {}));
+    // 3. Auto-split a fresh clean collateral UTXO via sendcurrency
+    //    (collateral + 0.0001 fee budget on borrower's R), OR — if a
+    //    locked UTXO from a previously-cancelled request happens to
+    //    match the same currency + amount — reuse it. Reuse keeps cancel
+    //    + repost cycles from leaving stranded lockunspent reservations.
+    const splitAmount = collateralAmount + 0.0001;
+    let borrowerInputTxid, borrowerInputVout = -1;
+    const reusable = await findReusableSplitUtxo(iaddr, borrowerR, collateralCurrency, splitAmount).catch(() => null);
+    if (reusable) {
+      previewEl.innerHTML = `<div class="review muted">Reusing locked ${collateralCurrency} UTXO from a cancelled request: <code>${escapeHtml(reusable.txid.slice(0,16))}…:${reusable.vout}</code></div>`;
+      previewEl.style.display = "block";
+      borrowerInputTxid = reusable.txid;
+      borrowerInputVout = reusable.vout;
+    } else {
+      previewEl.innerHTML = `<div class="review muted">Splitting a fresh ${collateralCurrency} UTXO via sendcurrency…</div>`;
+      previewEl.style.display = "block";
+      let splitTxid;
+      try {
+        const out = collateralCurrency === "VRSC"
+          ? [{ address: borrowerR, amount: splitAmount }]
+          : [{ currency: collateralCurrency, amount: splitAmount, address: borrowerR }];
+        const opid = await rpc("sendcurrency", [borrowerR, out]);
+        for (let i = 0; i < 30 && !splitTxid; i++) {
+          await new Promise((res) => setTimeout(res, 2000));
+          const r = await rpc("z_getoperationresult", [[opid]]);
+          const op = (r || [])[0];
+          if (op?.status === "success") splitTxid = op.result?.txid;
+          if (op?.status === "failed") throw new Error("split sendcurrency failed: " + JSON.stringify(op.error || {}));
+        }
+        if (!splitTxid) throw new Error("split sendcurrency timed out");
+      } catch (e) {
+        previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ collateral split failed: ${escapeHtml(e.message)}</div>`;
+        return;
       }
-      if (!splitTxid) throw new Error("split sendcurrency timed out");
-    } catch (e) {
-      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ collateral split failed: ${escapeHtml(e.message)}</div>`;
-      return;
-    }
-    // Locate the new clean UTXO in the split tx (mempool view).
-    const splitTx = await rpc("getrawtransaction", [splitTxid, 1]);
-    let borrowerInputVout = -1;
-    for (let i = 0; i < (splitTx?.vout || []).length; i++) {
-      const o = splitTx.vout[i];
-      const spk = o?.scriptPubKey || {};
-      const addrs = spk.addresses || [];
-      if (!addrs.includes(borrowerR)) continue;
-      const cv = spk.reserveoutput?.currencyvalues || {};
-      const cvKeys = Object.keys(cv);
-      if (collateralCurrency === "VRSC") {
-        if (cvKeys.length === 0 && Math.abs((o.value || 0) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
-      } else {
-        if (o.valueSat === 0 && cvKeys.length === 1 && Math.abs(parseFloat(Object.values(cv)[0]) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
+      // Locate the new clean UTXO in the split tx (mempool view).
+      const splitTx = await rpc("getrawtransaction", [splitTxid, 1]);
+      for (let i = 0; i < (splitTx?.vout || []).length; i++) {
+        const o = splitTx.vout[i];
+        const spk = o?.scriptPubKey || {};
+        const addrs = spk.addresses || [];
+        if (!addrs.includes(borrowerR)) continue;
+        const cv = spk.reserveoutput?.currencyvalues || {};
+        const cvKeys = Object.keys(cv);
+        if (collateralCurrency === "VRSC") {
+          if (cvKeys.length === 0 && Math.abs((o.value || 0) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
+        } else {
+          if (o.valueSat === 0 && cvKeys.length === 1 && Math.abs(parseFloat(Object.values(cv)[0]) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
+        }
       }
-    }
-    if (borrowerInputVout < 0) {
-      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ split tx didn't produce a clean ${escapeHtml(collateralCurrency)} output</div>`;
-      return;
-    }
-    const borrowerInputTxid = splitTxid;
-    // Reserve the freshly-split UTXO via lockunspent so no other wallet
-    // operation accidentally consumes it before Tx-A broadcasts. Without
-    // this, the borrower's pre-signed Tx-A input could be invalidated by
-    // a subsequent sendcurrency / consolidate. Lock is in-memory; on
-    // request cancel we unlock, on Tx-A broadcast it's spent naturally.
-    try {
-      await rpc("lockunspent", [false, [{ txid: borrowerInputTxid, vout: borrowerInputVout }]]);
-    } catch (e) {
-      console.warn("lockunspent failed (non-fatal):", e?.message);
+      if (borrowerInputVout < 0) {
+        previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ split tx didn't produce a clean ${escapeHtml(collateralCurrency)} output</div>`;
+        return;
+      }
+      borrowerInputTxid = splitTxid;
+      // Reserve the freshly-split UTXO via lockunspent so no other wallet
+      // operation accidentally consumes it before Tx-A broadcasts. Lock
+      // is in-memory; on request cancel we unlock, on Tx-A broadcast it's
+      // spent naturally. (Reused UTXOs are already locked from their
+      // original split — no second lock needed.)
+      try {
+        await rpc("lockunspent", [false, [{ txid: borrowerInputTxid, vout: borrowerInputVout }]]);
+      } catch (e) {
+        console.warn("lockunspent failed (non-fatal):", e?.message);
+      }
     }
 
     // 4. Compute vault P2SH from both pubkeys
@@ -4536,12 +4786,38 @@ async function loadActivity(targetEl) {
       const bB = b.__kind === "cancelled" ? b.cancel_block : (b.settled_at_block ?? b.posted_block);
       return (bB ?? 0) - (aB ?? 0);
     });
+
+    // Apply user-selected History filters (state + role).
+    // State chip → cancelled / repaid / defaulted; Role chip → borrower / lender.
+    // _myRole on cancelled rows is inferred from _vdxfType: a removed
+    // loan.request was posted by us-as-borrower; a removed loan.match was
+    // posted by us-as-lender.
+    const cancelRoleOf = (row) => row._vdxfType === "loan.match" ? "lender" : "borrower";
+    const filtered = flat.filter((r) => {
+      if (historyFilter !== "all") {
+        if (historyFilter === "cancelled") { if (r.__kind !== "cancelled") return false; }
+        else if (r.__kind !== "settled" || r.state !== historyFilter) return false;
+      }
+      if (historyRole !== "all") {
+        const role = r.__kind === "cancelled" ? cancelRoleOf(r) : r._myRole;
+        if (role !== historyRole) return false;
+      }
+      return true;
+    });
+
     const _ctHistory = document.getElementById("ct-history");
-    if (_ctHistory) _ctHistory.textContent = String(flat.length);
-    if (flat.length === 0) {
-      el.innerHTML = `<div class="empty">No completed loans yet. <span class="muted" style="font-size:11px">(checking daemon…)</span></div>`;
+    if (_ctHistory) {
+      _ctHistory.textContent = (historyFilter === "all" && historyRole === "all")
+        ? String(flat.length)
+        : `${filtered.length}/${flat.length}`;
+    }
+    if (filtered.length === 0) {
+      const empty = flat.length === 0
+        ? `No completed loans yet. <span class="muted" style="font-size:11px">(checking daemon…)</span>`
+        : `Nothing matches this filter — ${flat.length} hidden.`;
+      el.innerHTML = `<div class="empty">${empty}</div>`;
     } else {
-      el.innerHTML = flat.map((row) =>
+      el.innerHTML = filtered.map((row) =>
         row.__kind === "cancelled" ? renderCancelledRow(row) : renderHistoryRow(row)
       ).join("");
       enrichHistoryRows();
@@ -4606,29 +4882,60 @@ async function loadActivity(targetEl) {
 }
 
 // One row per cancellation event (request or match withdrawn before the
-// loan opened). Shows what was cancelled, by whom, when.
+// loan opened). Heading uses first-person "You withdrew…" when the
+// cancelled entry was posted by the iaddr the user is currently acting
+// as, otherwise third-person with the counterparty named.
+//
+// Stage: the user wants to know at what point the cancellation happened.
+// We can derive it from the payload's reference graph:
+//   - removed loan.request, no match field in payload → "before any match"
+//   - removed loan.request, payload.matched_by present → "after lender [X] matched"
+//   - removed loan.match, payload references request.iaddr → "before borrower
+//     accepted" (active loan would have left a loan.history we'd surface
+//     differently; cancellations reflect pre-acceptance state)
 function renderCancelledRow(row) {
   const p = row.payload || {};
   const isRequest = row._vdxfType === "loan.request";
-  const verb = isRequest ? "Request cancelled" : "Match cancelled";
-  const who = isRequest ? "Borrower withdrew their request" : "Lender withdrew their match";
-  // Match payloads have request.iaddr (the borrower); request payloads have
-  // their own posting iaddr (== row._myIaddr).
-  const otherParty = isRequest ? p.target_lender_iaddr : p.request?.iaddr;
+  const cancellerRole = isRequest ? "borrower" : "lender";
+  const isMyEntry = !!row._myIaddr; // walker only emits cancellations for OUR own iaddr
+  const counterparty = isRequest ? p.target_lender_iaddr : p.request?.iaddr;
+
+  // Headline verb. First-person when the cancelled entry was posted by the
+  // active iaddr (which is always the case for walker-emitted rows).
+  const headline = isMyEntry
+    ? (isRequest ? "You withdrew your loan request" : "You withdrew your match offer")
+    : (isRequest ? "Borrower withdrew their loan request" : "Lender withdrew their match offer");
+
+  // Stage indicator — best-effort from payload alone (no remote lookup).
+  let stage;
+  if (isRequest) {
+    stage = p.target_lender_iaddr
+      ? "after targeting a specific lender"
+      : "before any lender matched";
+  } else {
+    // loan.match cancellation. payload always carries request.iaddr +
+    // tx_a_full; if borrower had broadcast Tx-A (i.e. accepted), the loan
+    // would have moved to loan.status — so a removed loan.match means
+    // the borrower had NOT yet accepted at cancel time.
+    stage = "before borrower accepted";
+  }
+
   const ts = row.cancel_ts ? new Date(row.cancel_ts).toISOString().slice(0, 16).replace("T", " ") : "";
+  const counterpartyLabel = isRequest ? "target lender" : "borrower";
+
   return `
     <div class="card" data-cancel-tx="${escapeHtml(row.cancel_txid || '')}">
       <div class="row" style="margin-bottom:6px">
-        <strong style="flex:1">${escapeHtml(verb)}</strong>
-        <span class="badge" style="background:rgba(120,120,120,0.2);color:#888">cancelled</span>
+        <strong style="flex:1">${escapeHtml(headline)}</strong>
+        <span class="badge" title="role of cancelling party" style="background:rgba(120,120,120,0.2);color:#888">cancelled · ${escapeHtml(cancellerRole)}</span>
       </div>
-      <div class="muted" style="font-size:13px;margin-bottom:6px">${escapeHtml(who)}</div>
+      <div class="muted" style="font-size:13px;margin-bottom:6px">Stage: ${escapeHtml(stage)}</div>
       <div class="kv" style="font-size:12px">
         ${p.principal ? `<div><span class="k">principal</span><span class="v">${formatAmount(p.principal)}</span></div>` : ""}
         ${p.collateral ? `<div><span class="k">collateral</span><span class="v">${formatAmount(p.collateral)}</span></div>` : ""}
         ${p.repay ? `<div><span class="k">repay</span><span class="v">${formatAmount(p.repay)}</span></div>` : ""}
         ${p.term_days != null ? `<div><span class="k">term</span><span class="v">${escapeHtml(p.term_days)}d</span></div>` : ""}
-        ${otherParty ? `<div><span class="k">${isRequest ? "target lender" : "borrower"}</span><span class="v"><a href="/address/${escapeHtml(otherParty)}" class="font-mono">${escapeHtml(otherParty.slice(0, 16))}…</a></span></div>` : ""}
+        ${counterparty ? `<div><span class="k">${counterpartyLabel}</span><span class="v"><a href="/address/${escapeHtml(counterparty)}" class="font-mono">${escapeHtml(counterparty.slice(0, 16))}…</a></span></div>` : ""}
         <div><span class="k">cancelled</span><span class="v">block ${row.cancel_block ?? "?"} <span class="cancelled-ts ${ts ? '' : 'muted'}">${escapeHtml(ts)}${ts ? ' UTC' : ''}</span></span></div>
         <div><span class="k">cancel tx</span><span class="v"><a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(row.cancel_txid || "")}" target="_blank"><code>${escapeHtml((row.cancel_txid || "").slice(0, 20))}…</code></a></span></div>
       </div>
