@@ -3383,9 +3383,24 @@ async function findReusableSplitUtxo(iaddr, borrowerR, currency, splitAmount) {
     }
   }
 
+  // Pull the live unspent set at borrowerR so we can confirm the locked
+  // UTXO is still actually unspent. lockunspent state can lag reality —
+  // a UTXO may have been consumed by a tx without the lock being cleared
+  // (e.g. early termination of a flow), leaving a "stale" lock that
+  // would otherwise be picked up here and crash signrawtransaction with
+  // "Input not found or already spent."
+  const liveUtxos = await rpc("getaddressutxos", [{ addresses: [borrowerR] }]).catch(() => []);
+  const liveSet = new Set(liveUtxos.map((u) => `${u.txid}:${u.outputIndex}`));
+
   for (const u of locked) {
     const key = `${u.txid}:${u.vout}`;
     if (inUse.has(key)) continue; // still bound to a live request
+    if (!liveSet.has(key)) {
+      // Stale lock — UTXO has been spent on chain. Best-effort unlock so
+      // we don't keep tripping over this entry on every preview.
+      await rpc("lockunspent", [true, [{ txid: u.txid, vout: u.vout }]]).catch(() => {});
+      continue;
+    }
     const tx = await rpc("getrawtransaction", [u.txid, 1]).catch(() => null);
     const out = tx?.vout?.[u.vout];
     if (!out) continue;
