@@ -4024,10 +4024,15 @@ function renderActiveLoan(r, tipHeight) {
           ? `<button class="ghost remove-btn" data-loan-act="cancel-match" data-counterparty-iaddr="${escapeHtml(r.counterparty_iaddr || '')}" style="flex:0 0 auto">Cancel match</button>
              <span class="muted" style="font-size:11px;align-self:center">Borrower's auto-accept broadcasts Tx-A within ~30s. Cancel only if you want to withdraw your commitment before they do.</span>`
           : r.role === "borrower"
-          ? hasRepay
-            ? `<button class="primary" data-loan-act="repay">Repay</button>
-               <span class="muted" style="font-size:11px;margin-left:8px">Auto-splits a fresh repayment UTXO + extends Tx-Repay + broadcasts. Then posts loan.history (settled).</span>`
-            : `<button class="primary" disabled title="Tx-Repay not in this browser's localStorage — accept on this device or import the template">Repay</button>`
+            // Borrower can repay any time; if Tx-Repay isn't in this
+            // browser's localStorage the click handler recovers it from
+            // the borrower's own loan.status.tx_repay_signed (and falls
+            // back to the lender's loan.match.tx_repay_partial). So the
+            // button is always actionable — no disabled state.
+          ? `<button class="primary" data-loan-act="repay">Repay</button>
+             <span class="muted" style="font-size:11px;margin-left:8px">${hasRepay
+               ? "Auto-splits a fresh repayment UTXO + extends Tx-Repay + broadcasts. Then posts loan.history (settled)."
+               : "Will recover Tx-Repay from your loan.status (or the lender's match) before broadcasting."}</span>`
           : claimable
             ? `<button class="primary" disabled title="GUI Tx-B claim flow not yet wired — for now broadcast Tx-B manually via the SPEC's recipe (lender extends pre-signed Tx-B with their input, signs, sendrawtransaction)">Claim collateral (manual — see SPEC)</button>
                <span style="color:var(--ok);font-size:11px;align-self:center">Maturity reached.</span>`

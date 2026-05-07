@@ -194,7 +194,7 @@ button.primary {
   cursor: pointer;
   font: inherit;
 }
-button.primary:hover { opacity: 0.9; }
+button.primary:not(:disabled):hover { opacity: 0.9; }
 
 button.ghost {
   background: transparent;
