@@ -1310,10 +1310,12 @@ async function loadMarket() {
 
     const sectionHeader = (label) =>
       `<div style="margin:14px 0 6px 0;font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;color:var(--muted)">${label}</div>`;
+    // Tip height drives the lender Claim collateral countdown.
+    const _tipHeight = await rpc("getblockcount", []).catch(() => 0);
     const parts = [];
     if (activeRows.length) {
       parts.push(sectionHeader("Active loans"));
-      parts.push(activeRows.map(renderActiveLoan).join(""));
+      parts.push(activeRows.map((r) => renderActiveLoan(r, _tipHeight)).join(""));
     }
     if (actionCount > 0) {
       parts.push(sectionHeader("Awaiting your action"));
