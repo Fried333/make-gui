@@ -4190,6 +4190,16 @@ async function enrichActiveLoanBalances() {
   }
 
   if (btn.dataset.loanAct === "repay") {
+    // Confirm before broadcasting — repay sends the principal + interest
+    // to the lender and is irreversible. Read terms off the card so the
+    // dialog shows what's being paid, not just "are you sure".
+    const repayCcy = card.dataset.repayCurrency || "?";
+    const repayAmt = card.dataset.repayAmount   || "?";
+    const counterparty = card.querySelector('.kv .v')?.textContent?.trim() || "(lender)";
+    if (!confirm(`Repay ${repayAmt} ${repayCcy} now?\n\nThis broadcasts Tx-Repay (your repayment + the vault's collateral release) and posts loan.history(repaid). Both legs are irreversible.\n\nLender: ${counterparty}`)) {
+      delete card.dataset.opActive;
+      return;
+    }
     btn.disabled = true; btn.textContent = "Loading Tx-Repay…";
     try {
       // Load borrower's loan.status first — needed for repay terms AND
