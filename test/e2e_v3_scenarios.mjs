@@ -165,8 +165,12 @@ async function recoverStrandedVault() {
   const bal = cliJ(`getaddressbalance '{"addresses":["${VAULT_ADDR}"]}'`);
   if (!bal?.balance) return null;
   console.log(`  [recovery] stranded vault has ${bal.balance / 1e8} VRSC — running recover_vault.sh`);
+  // Protocol-level helper lives in the spec repo (veruslending/helpers/)
+  // — it's pure RPC, no GUI dependency. Override via RECOVER_VAULT env if
+  // you've moved it elsewhere.
+  const recoverScript = process.env.RECOVER_VAULT || "/home/dev/veruslending/helpers/recover_vault.sh";
   try {
-    execSync(`bash /home/dev/recover_vault.sh`, { stdio: "inherit", encoding: "utf8" });
+    execSync(`bash ${recoverScript}`, { stdio: "inherit", encoding: "utf8" });
   } catch (e) {
     throw new Error(`vault recovery failed: ${e.message.slice(0, 200)}`);
   }

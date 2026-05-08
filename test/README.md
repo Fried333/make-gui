@@ -5,8 +5,15 @@ End-to-end + unit tests for the v3 contract protocol.
 ## Files
 
 - **`e2e_v3_scenarios.mjs`** — 9 mainnet end-to-end scenarios driving the GUI via Playwright. Real funds, real fees, real confirmations. Each scenario resets transient state, runs the flow, and asserts on-chain + UI outcome.
-- **`recover_vault.sh`** — Cooperative 2-of-2 vault drain. Idempotent — exits 0 if vault is empty. Used to recover from a half-finished scenario (borrower→lender repay then drain collateral back to borrower).
-- **`vault_v4_validation.mjs`** — Tweaked-key (option C) math + encoding round-trip checks. No funds moved; pure local verification.
+- **`vault_v4_validation.mjs`** — Tweaked-key (option C) crypto math + encoding round-trip checks for `static/js/tweaked-key.js`. No funds moved; pure local verification.
+
+## Test split
+
+This repo holds **GUI-driven** tests (Playwright + JS unit tests against modules under `static/js/`).
+
+**Protocol-level / chain-only tests** live in the spec repo at [`veruslending/helpers/`](https://github.com/Fried333/veruslending/tree/main/helpers) — `recover_vault.sh` (cooperative 2-of-2 vault drain) and `extend_tx.py` (raw-tx extension helper). Anything that's pure RPC with no DOM dependency belongs there.
+
+The e2e suite shells out to `helpers/recover_vault.sh` from the spec repo by default (`/home/dev/veruslending/helpers/recover_vault.sh`); override with `RECOVER_VAULT=/path/to/script` if you've moved it.
 
 ## Running the e2e suite
 
