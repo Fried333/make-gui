@@ -1031,6 +1031,71 @@ async function scenario13_replaySafety() {
   } finally { await bb.close(); }
 }
 
+// ── SCENARIO 14: lender declines borrower's request ──────────────────
+// Borrower posts a request with auto_accept=false. Lender's GUI opens
+// the Fund panel (auto-load). Lender clicks Decline. Asserts:
+//   - lender's identity has a fresh loan.decline entry pointing at
+//     borrower's request_txid
+//   - borrower's loan.request stays on chain (not modified by lender)
+//   - borrower-side decline watcher's seen-set picks up the entry
+async function scenario14_lenderDeclines() {
+  const VDXF_DECLINE = "iBhQXJ21aqiH9kFvGqUrQy7MnKBdq1eyKc";
+  const { browser: bb, page: bp } = await openPage(BORROWER_GUI, BORROWER_IA);
+  try {
+    console.log("  borrower posts request (auto_accept=false)…");
+    await postRequestViaGui(bp, {
+      lender: LENDER_IA,
+      principal: 5, principalCcy: "DAI.vETH",
+      collateral: 10, collateralCcy: "VRSC",
+      repay: 5.05, term: 30, autoAccept: false,
+    });
+    console.log("  ✓ request posted");
+
+    const { browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA);
+    try {
+      // Wait for lender's GUI to surface the request + Fund panel.
+      console.log("  waiting for lender's Fund panel to render…");
+      await pollUntil("fund panel visible", async () => {
+        await lp.evaluate(() => document.getElementById("market-refresh")?.click());
+        await sleep(2500);
+        return await lp.evaluate(() => !!document.querySelector('[data-mp-row-act="post-match-decline"]'));
+      }, { intervalMs: 1500 });
+      console.log("  ✓ Decline button visible");
+
+      // Override window.confirm so the click goes through without modal.
+      await lp.evaluate(() => { window.confirm = () => true; });
+
+      console.log("  lender clicks Decline…");
+      await lp.evaluate(() => document.querySelector('[data-mp-row-act="post-match-decline"]').click());
+
+      // Wait for the loan.decline entry to land on the lender's identity.
+      const decline = await pollUntil("loan.decline on lender's identity", () => {
+        const cm = multimapOf(LENDER_IA, true);
+        const ents = (cm[VDXF_DECLINE] || []).map(decodeEntry).filter(Boolean);
+        return ents.find((d) => d.borrower_iaddr === BORROWER_IA);
+      }, { intervalMs: 3000 });
+      console.log(`  ✓ loan.decline posted; reason=${decline.reason ?? "(none)"}`);
+
+      // Sanity: borrower's loan.request is still on chain, untouched.
+      const borrowerCm = multimapOf(BORROWER_IA);
+      const reqs = (borrowerCm[VDXF.request] || []).map(decodeEntry).filter(Boolean);
+      const myReq = reqs.find((r) => r.target_lender_iaddr === LENDER_IA);
+      if (!myReq) throw new Error("borrower's loan.request was modified — lender shouldn't be able to do that");
+      console.log("  ✓ borrower's request unchanged on chain");
+    } finally { await lb.close(); }
+
+    // Borrower-side check: refresh + verify decline banner appears.
+    console.log("  refreshing borrower's loans tab — expecting decline banner…");
+    await bp.evaluate(() => document.getElementById("market-refresh")?.click());
+    await pollUntil("decline banner on borrower's GUI", async () =>
+      await bp.evaluate(() => !!document.querySelector(".decline-banner")),
+      { intervalMs: 3000 });
+    const bannerText = await bp.evaluate(() => document.querySelector(".decline-banner")?.innerText || "");
+    if (!/declined/i.test(bannerText)) throw new Error(`unexpected banner text: ${bannerText.slice(0,200)}`);
+    console.log(`  ✓ borrower sees decline banner: "${bannerText.replace(/\s+/g, " ").slice(0,140)}…"`);
+  } finally { await bb.close(); }
+}
+
 // ── Main runner ──────────────────────────────────────────────────────
 
 (async () => {
@@ -1049,6 +1114,7 @@ async function scenario13_replaySafety() {
   await maybe(9, "9. borrower insufficient collateral",         scenario9_borrowerInsufficient);
   await maybe(12, "12. chain-only recovery (past revisions)",   scenario12_chainOnlyRecovery);
   await maybe(13, "13. replay safety across loans",             scenario13_replaySafety);
+  await maybe(14, "14. lender declines borrower's request",     scenario14_lenderDeclines);
 
   // Final cleanup
   console.log("\n=== final cleanup ===");
