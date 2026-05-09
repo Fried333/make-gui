@@ -840,6 +840,197 @@ async function scenario9_borrowerInsufficient() {
   } finally { await bb.close(); }
 }
 
+// ── SCENARIO 12: chain-only recovery via past identity revisions ─────
+// Wipes lender's loan.match AND borrower's loan.status.tx_repay_signed
+// (the latter by stripping the field, like scenario 6 does). Borrower's
+// localStorage cache is also wiped. The only path to settle is for the
+// repay handler to walk getidentityhistory (tier 4) and recover the
+// lender's tx_repay_partial from a past revision, then re-cosign.
+//
+// Note: a fully aggressive wipe (also dropping the entire borrower
+// loan.status entry) is not testable through the current GUI because
+// loadLoans only renders cards for loans visible in the live multimap.
+// That requires a "recover loan from chain history" UI feature first.
+// Captured as scenario 12b (TODO); scenario 12 here proves the tier 4
+// fallback works.
+async function scenario12_chainOnlyRecovery() {
+  const { browser: bb, page: bp } = await openPage(BORROWER_GUI, BORROWER_IA);
+  try {
+    console.log("  posting request + match + auto-accept…");
+    await postRequestViaGui(bp, {
+      lender: LENDER_IA, principal: 5, principalCcy: "DAI.vETH",
+      collateral: 10, collateralCcy: "VRSC", repay: 5.05, term: 30, autoAccept: true,
+    });
+    const { browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA);
+    try { await postMatchViaGui(lp); } finally { await lb.close(); }
+    await bp.evaluate(() => document.querySelector('[data-mp-tab="loans"]')?.click());
+    const status = await waitForActiveLoan();
+    console.log(`  ✓ loan opened: ${status.loan_id.slice(0,12)}…`);
+
+    console.log("  wiping lender's live loan.match (Tx-A stays on chain; entry persists in past revision)");
+    await waitForIdentityMempoolEmpty(LENDER_IA, true);
+    await dropEntries(LENDER_IA, [VDXF.match], true);
+    await pollUntil("loan.match removed from lender live", () => {
+      const cm = multimapOf(LENDER_IA, true);
+      const ents = (cm[VDXF.match] || []).map(decodeEntry).filter(Boolean);
+      return !ents.find((m) => m.tx_a_txid === status.loan_id);
+    }, { intervalMs: 3000 });
+    console.log("  ✓ lender's live loan.match wiped");
+
+    console.log("  stripping tx_repay_signed from borrower's loan.status + clearing localStorage…");
+    await bp.evaluate((loanId) => localStorage.removeItem(`vl_tx_repay_${loanId}`), status.loan_id);
+    await waitForIdentityMempoolEmpty(BORROWER_IA);
+    const ident = cliJ(`getidentity ${BORROWER_IA} -1`).identity;
+    const cmExisting = ident.contentmultimap || {};
+    const newCm = {};
+    for (const [k, arr] of Object.entries(cmExisting)) {
+      if (k === VDXF.status) {
+        const stripped = (arr || []).map((e) => {
+          const hex = typeof e === "string" ? e : (e.serializedhex || e.message || "");
+          if (!hex) return null;
+          try {
+            const j = JSON.parse(Buffer.from(hex, "hex").toString("utf8"));
+            if (j.loan_id === status.loan_id) {
+              delete j.tx_repay_signed;
+              return Buffer.from(JSON.stringify(j), "utf8").toString("hex");
+            }
+            return hex;
+          } catch { return hex; }
+        }).filter(Boolean);
+        if (stripped.length) newCm[k] = stripped;
+      } else {
+        const norm = (arr || []).map((e) => typeof e === "string" ? e : (e.serializedhex || e.message || "")).filter(Boolean);
+        if (norm.length) newCm[k] = norm;
+      }
+    }
+    const arg = JSON.stringify({ name: ident.name, parent: ident.parent || "", contentmultimap: newCm });
+    cli(`updateidentity '${arg.replace(/'/g, "'\\''")}'`);
+    await pollUntil("tx_repay_signed strip confirmed", () => {
+      const cm2 = multimapOf(BORROWER_IA);
+      const updated = (cm2[VDXF.status] || []).map(decodeEntry).filter(Boolean).find((s) => s.loan_id === status.loan_id);
+      return updated && !updated.tx_repay_signed;
+    }, { intervalMs: 3000 });
+    console.log("  ✓ all live tx_repay sources wiped — chain history is the only source");
+
+    console.log("  clicking Repay (must walk getidentityhistory tier 4)…");
+    await clickRepay(bp, status.loan_id);
+    await waitForRepaid(status.loan_id);
+    await pollUntil("vault drained", () => {
+      const utxos = cliJ(`getaddressutxos '{"addresses":["${VAULT_ADDR}"]}'`);
+      return Array.isArray(utxos) && utxos.length === 0;
+    }, { intervalMs: 2000 });
+    console.log("  ✓ chain-only recovery succeeded — past-revision fallback works");
+  } finally { await bb.close(); }
+}
+
+// ── SCENARIO 13: replay-safety across loans ──────────────────────────
+// Same (borrower, lender) pair share the same deterministic vault P2SH.
+// We don't need to open two consecutive loans in the test — past loans
+// are already on chain via getidentityhistory. Walk past revisions to
+// find a previously-settled loan, pull its tx_repay_signed, and try to
+// replay it. The vault UTXO it referenced is consumed, so the daemon
+// must reject with bad-txns-inputs-spent (or equivalent).
+//
+// If a Loan A is already settled in chain history, we just need ONE
+// fresh Loan B to set up an active vault UTXO for the replay attempt.
+// Skipping the Loan-A-from-scratch step shaves ~10min off the test.
+async function scenario13_replaySafety() {
+  // 1. Walk borrower's identity history for a past loan.history(repaid),
+  // grab its tx_repay_txid (the actual broadcast settlement tx), then
+  // fetch the full broadcast tx hex via getrawtransaction. THAT is what
+  // a replay attacker would have at hand — the tx that already settled
+  // a past loan, complete with funding input + borrower sig. We try to
+  // re-broadcast it and assert daemon rejects.
+  //
+  // (loan.status.tx_repay_signed is a partial — vault-half only — not
+  // directly broadcastable. The on-chain broadcast tx is the right
+  // replay subject because it's a fully-formed valid tx for its time.)
+  console.log("  scanning borrower identity history for a past loan.history(repaid)…");
+  const hist = cliJ(`getidentityhistory ${BORROWER_IA} 0 -1`);
+  const revs = hist?.history || [];
+  console.log(`  ${revs.length} identity revisions to scan`);
+  let pastTxRepayTxid = null, pastLoanId = null;
+  for (const rev of revs) {
+    const cm = rev?.identity?.contentmultimap || {};
+    for (const e of (cm[VDXF.history] || [])) {
+      const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+      if (!hex) continue;
+      try {
+        const j = JSON.parse(Buffer.from(hex, "hex").toString("utf8"));
+        if (j.outcome === "repaid" && j.tx_repay_txid && j.loan_id) {
+          pastTxRepayTxid = j.tx_repay_txid;
+          pastLoanId = j.loan_id;
+          break;
+        }
+      } catch {}
+    }
+    if (pastTxRepayTxid) break;
+  }
+  if (!pastTxRepayTxid) throw new Error("no past loan.history(repaid) with tx_repay_txid in borrower identity history — can't run replay test");
+  console.log(`  found settled loan ${pastLoanId.slice(0,12)}… tx_repay_txid=${pastTxRepayTxid.slice(0,16)}…`);
+
+  // Fetch the full broadcast Tx-Repay hex (decoded form is valid; we'll
+  // try to re-broadcast the raw hex and expect rejection).
+  let pastTxRepayHex;
+  try {
+    pastTxRepayHex = cli(`getrawtransaction ${pastTxRepayTxid}`);
+  } catch (e) {
+    throw new Error(`couldn't fetch raw tx for past tx_repay ${pastTxRepayTxid}: ${e.message}`);
+  }
+  console.log(`  fetched past Tx-Repay raw hex (${pastTxRepayHex.length / 2} bytes)`);
+
+  // 2. Open a fresh Loan B so vault has a current UTXO (replay target).
+  const { browser: bb, page: bp } = await openPage(BORROWER_GUI, BORROWER_IA);
+  try {
+    console.log("  Loan B: opening fresh vault UTXO…");
+    await postRequestViaGui(bp, {
+      lender: LENDER_IA, principal: 5, principalCcy: "DAI.vETH",
+      collateral: 10, collateralCcy: "VRSC", repay: 5.05, term: 30, autoAccept: true,
+    });
+    const { browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA);
+    try { await postMatchViaGui(lp); } finally { await lb.close(); }
+    await bp.evaluate(() => document.querySelector('[data-mp-tab="loans"]')?.click());
+    const statusB = await waitForActiveLoan();
+    console.log(`  Loan B loan_id: ${statusB.loan_id.slice(0,12)}…`);
+    if (statusB.loan_id === pastLoanId) throw new Error("Loan B has same loan_id as the past settled loan — UTXO didn't change?");
+
+    // 3. Replay attempt: broadcast past loan's actual Tx-Repay raw hex.
+    // That tx already mined into a block — daemon must reject as already
+    // known (or report the tx as already in chain). Either way, no
+    // re-execution against any current vault UTXO.
+    console.log("  replay attempt: broadcasting past loan's full Tx-Repay raw hex…");
+    let attemptErr = "";
+    try {
+      const result = cli(`sendrawtransaction ${pastTxRepayHex}`);
+      throw new Error(`REPLAY VULNERABILITY: past Tx-Repay accepted on chain: ${result}`);
+    } catch (e) {
+      attemptErr = e.message;
+    }
+    // Acceptable rejection patterns:
+    //   - "tx-expiring-soon" — Verus's expiryheight field; old txs can't
+    //     be rebroadcast outside their original ~20-block window. This is
+    //     the FIRST defense against replay (in addition to spent inputs).
+    //   - "inputs-spent" / "missing-inputs" — vault UTXO already consumed.
+    //   - "already in block/mempool/chain" / "already known" — exact tx
+    //     already mined; daemon dedups.
+    //   - "conflict" — generic spend conflict.
+    if (!/expiring|expir.*height|inputs[-_]spent|already.*spent|missing.*inputs|conflict|bad-txns|already in (block|mempool)|already known|already.*chain/i.test(attemptErr)) {
+      throw new Error(`past Tx-Repay rejected but error was unexpected: ${attemptErr.slice(0,400)}`);
+    }
+    console.log(`  ✓ rejection: ${attemptErr.match(/[a-z][a-z-]+(?:[-_][a-z]+)*/i)?.[0] || "rejected"} — replay blocked at protocol level`);
+
+    // 4. Settle Loan B normally to confirm it isn't affected by the attempt
+    console.log("  settling Loan B normally…");
+    await clickRepay(bp, statusB.loan_id);
+    await waitForRepaid(statusB.loan_id);
+    await pollUntil("Loan B vault drained", () => {
+      const utxos = cliJ(`getaddressutxos '{"addresses":["${VAULT_ADDR}"]}'`);
+      return Array.isArray(utxos) && utxos.length === 0;
+    }, { intervalMs: 2000 });
+    console.log("  ✓ Loan B settled normally — replay attempt didn't affect chain state");
+  } finally { await bb.close(); }
+}
+
 // ── Main runner ──────────────────────────────────────────────────────
 
 (async () => {
@@ -856,6 +1047,8 @@ async function scenario9_borrowerInsufficient() {
   await maybe(7, "7. match safety check (probe only)",          scenario7_badMatchSafety);
   await maybe(8, "8. lender insufficient principal",            scenario8_lenderInsufficient);
   await maybe(9, "9. borrower insufficient collateral",         scenario9_borrowerInsufficient);
+  await maybe(12, "12. chain-only recovery (past revisions)",   scenario12_chainOnlyRecovery);
+  await maybe(13, "13. replay safety across loans",             scenario13_replaySafety);
 
   // Final cleanup
   console.log("\n=== final cleanup ===");
