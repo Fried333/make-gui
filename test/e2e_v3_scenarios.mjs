@@ -17,11 +17,11 @@ const BORROWER_R   = "RSiyiZ92PeBDEJskMLzmUCSjJEW45iWnsF";
 const LENDER_R     = "RKGN34UhN62C8KaQeHTkMr7L3Mqn9oW2ve";
 
 const VDXF = {
-  request:  "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW",
-  match:    "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt",
-  status:   "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j",
-  history:  "iBGuPDeeHHYpvKdM7VG2d7LR1Lct9itcpT",
-  offer:    "iA1vgVBV5B29h5pxQ67gxqCoEaLDZ8WbmY",
+  request:  "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5",
+  match:    "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U",
+  status:   "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4",
+  history:  "i5qBwi3KWXfyo1UKuUBC3yyq67JagVennW",
+  offer:    "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz",
 };
 // loan.history accumulates across runs; the multimap encoder errors with
 // "bad-txns-script-element-too-large" once the per-key blob exceeds limits.
