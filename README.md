@@ -1,11 +1,11 @@
-# verus_contract_gui
+# make-gui
 
-A minimal local web app for browsing and acting on Verus contract markets
-(loan offers, loan requests, loan matches, loan status) directly against
-your local `verusd` daemon.
+A minimal local web app for browsing and acting on Make Protocol contract
+markets (loan offers, loan requests, loan matches, loan status, option
+offers) directly against your local `verusd` daemon.
 
-This is a reference implementation of the contract-marketplace data layer
-specified in [veruslending/SCHEMA.md](https://github.com/Fried333/veruslending/blob/main/SCHEMA.md).
+This is a reference client for the data layer specified in
+[make-protocol/SCHEMA.md](https://github.com/Fried333/make-protocol/blob/main/SCHEMA.md).
 Anyone can fork, extend, or replace it — the chain is the source of truth.
 
 ## What it does
@@ -79,22 +79,30 @@ privacy / latency tradeoffs are.
 
 ## VDXF keys recognised
 
+All keys are namespaced under `make.VRSC@`
+(`iLWvRsiWVCEuFYhCSt2Qba7LxWksrgVerX`), the registered owner of the
+Make Protocol contracts standard.
+
 | Key | VDXF id |
 |---|---|
-| `vrsc::contract.loan.offer` | `iA1vgVBV5B29h5pxQ67gxqCoEaLDZ8WbmY` |
-| `vrsc::contract.loan.request` | `iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28` |
-| `vrsc::contract.loan.match` | `iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT` |
-| `vrsc::contract.loan.status` | `iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys` |
-| `vrsc::contract.option.offer` | `i4a42EUWLvJTHYGW7F8RifY1Rvs5AQGioY` |
-| `vrsc::contract.option.request` | `iDE4csgPBx9Rn7H4zkn4VhSShcxcwmknQo` |
+| `make.vrsc::contract.loan.offer` | `iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz` |
+| `make.vrsc::contract.loan.request` | `iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5` |
+| `make.vrsc::contract.loan.match` | `iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U` |
+| `make.vrsc::contract.loan.status` | `iRzM96sNYj95mUiJebzBnFwirjfws2q6o4` |
+| `make.vrsc::contract.loan.history` | `i5qBwi3KWXfyo1UKuUBC3yyq67JagVennW` |
+| `make.vrsc::contract.loan.decline` | `iEgciB3u2GwTxzShQR4eFhtj4k8Zv6frNb` |
+| `make.vrsc::contract.option.offer` | `i5L8vkz9xsnM8yEDiXzPbP4Kix3SnJSsv5` |
 
-VDXF ids are deterministic: `verus getvdxfid "vrsc::contract.loan.offer"`.
+VDXF ids are deterministic — re-derive any of them with
+`verus getvdxfid "make.vrsc::contract.loan.offer"`.
 
 ## End-to-end validation
 
-Full lifecycle (request → match → accept → repay) validated via Playwright
-driving two browser instances against two local daemons on Verus mainnet.
-See `gui_e2e_borrower_first.mjs` in the spec repo for the test driver.
+Full lifecycle (request → match → accept → repay, plus 8 edge cases —
+cancels, manual accept, lost localStorage, insufficient funds, chain-only
+recovery, replay safety) validated via Playwright driving two browser
+instances against two local daemons on Verus mainnet. See
+`test_e2e_v3_all.mjs` for the test driver.
 
 ## What's NOT yet wired
 
@@ -113,6 +121,6 @@ MIT.
 
 ## Related
 
-- Spec / protocol: [github.com/Fried333/veruslending](https://github.com/Fried333/veruslending)
+- Spec / protocol: [github.com/Fried333/make-protocol](https://github.com/Fried333/make-protocol)
 - Public block explorer: [scan.verus.cx](https://scan.verus.cx)
 - Verus: [verus.io](https://verus.io)
