@@ -64,9 +64,18 @@ Then open the URL in any browser. No installation, no extension.
 
 State model:
 - **Browser localStorage**: ephemeral UI state (selected R-address, ID).
-- **Local daemon**: source of identity / wallet truth.
-- **Explorer API**: aggregated network-wide marketplace data.
+- **Local daemon**: source of truth for your own state and any
+  counterparty you've transacted with (mempool-aware via
+  `getidentity <iaddr> -1`).
+- **Explorer API**: stranger discovery only — used by the Marketplace
+  tab to find offers from parties you haven't met yet, and to walk
+  full reputation history. The Loans tab is **daemon-only** — works
+  even if the explorer is down.
 - **Chain**: ultimate source of truth. Local + explorer are derivative.
+
+See [`DATA_SOURCES.md`](./DATA_SOURCES.md) for the per-feature breakdown
+of which calls go to your daemon vs. the explorer, why, and what the
+privacy / latency tradeoffs are.
 
 ## VDXF keys recognised
 
