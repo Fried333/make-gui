@@ -4130,7 +4130,7 @@ async function doUpdateCollateralSuggestion(formEl) {
   if (principalCcy === collCcy) {
     const suggested = principalAmt * minRatio;
     applySuggestedCollateral(formEl, suggested);
-    sugEl.innerHTML = `Auto-set collateral for ${minRatio}× coverage: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code>`;
+    sugEl.innerHTML = `Auto-set collateral for ${minRatio}× coverage: <code>${suggested.toFixed(4)} ${escapeHtml(displayCurrency(collCcy))}</code>`;
     return;
   }
 
@@ -4171,8 +4171,8 @@ async function doUpdateCollateralSuggestion(formEl) {
   const suggested = principalInCollCcy * minRatio;
   applySuggestedCollateral(formEl, suggested);
   const viaLabel = viaUsed ? ` <span class="muted" style="font-size:11px">via ${escapeHtml(viaUsed)}</span>` : "";
-  sugEl.innerHTML = `At current rate, ${principalAmt} ${escapeHtml(principalCcy)} ≈ ${principalInCollCcy.toFixed(4)} ${escapeHtml(collCcy)}${viaLabel}. `
-    + `Auto-set ${minRatio}× collateral: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code>`;
+  sugEl.innerHTML = `At current rate, ${principalAmt} ${escapeHtml(displayCurrency(principalCcy))} ≈ ${principalInCollCcy.toFixed(4)} ${escapeHtml(displayCurrency(collCcy))}${viaLabel}. `
+    + `Auto-set ${minRatio}× collateral: <code>${suggested.toFixed(4)} ${escapeHtml(displayCurrency(collCcy))}</code>`;
 }
 
 // Populate the collateral_amount field with the oracle-derived value and
@@ -4189,6 +4189,14 @@ function applySuggestedCollateral(formEl, suggested) {
   // Subsequent: only overwrite if current value matches our last auto-set
   // (user hasn't typed something different in the meantime).
   if (lastAuto !== undefined && input.value !== lastAuto) return;
+  // No-op when the value is already what we'd set. Without this guard the
+  // input event below re-triggers runFormValidation → updateCollateralSuggestion
+  // → applySuggestedCollateral, causing an infinite re-render loop that
+  // makes the form visibly "bounce" as messages/heights cycle.
+  if (input.value === formatted) {
+    input.dataset.lastAutoVal = formatted;
+    return;
+  }
   input.value = formatted;
   input.dataset.lastAutoVal = formatted;
   input.dispatchEvent(new Event("input", { bubbles: true }));
