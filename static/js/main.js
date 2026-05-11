@@ -4122,6 +4122,21 @@ document.addEventListener("click", (ev) => {
   collInput.dispatchEvent(new Event("input", { bubbles: true }));
 });
 
+// Live recalc of the offer form's "Effective minimum on wire" hint as the
+// lender adjusts target_ratio / slippage_pct. min_collateral_ratio on the
+// wire = target × (1 - slippage/100). Delegation-based so it survives
+// innerHTML re-renders of the form panel.
+document.addEventListener("input", (ev) => {
+  const t = ev.target;
+  if (!t.matches?.('[data-f="target_ratio"], [data-f="slippage_pct"]')) return;
+  const form = t.closest('#mp-post-form, .post-box');
+  if (!form) return;
+  const tgt = parseFloat(form.querySelector('[data-f="target_ratio"]')?.value) || 0;
+  const slp = parseFloat(form.querySelector('[data-f="slippage_pct"]')?.value) || 0;
+  const out = form.querySelector('.effective-min-display code');
+  if (out) out.textContent = `${(tgt * (1 - slp / 100)).toFixed(4)}×`;
+});
+
 // Smart UTXO reuse: scan the wallet's locked UTXOs for one at borrowerR
 // that matches the requested currency + amount AND isn't already
 // referenced by an active loan.request (i.e. the original request was
@@ -4286,8 +4301,13 @@ function renderOfferFormBody() {
       </div>
     </div>
     <div class="row" style="margin-top:8px">
-      <label style="flex:1">Min collateral ratio<input type="number" data-f="min_ratio" value="2" step="0.1" /></label>
+      <label style="flex:1">Target ratio<input type="number" data-f="target_ratio" value="2" step="0.1" /></label>
+      <label style="flex:1">Slippage tolerance %<input type="number" data-f="slippage_pct" value="1" step="0.5" /></label>
       <label style="flex:1">Rate (decimal)<input type="number" data-f="rate" value="0.01" step="0.001" /></label>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:-4px">
+      Effective minimum on wire: <span class="effective-min-display"><code>1.9800×</code></span>
+      <span class="muted">— what auto-fund will accept after price drift</span>
     </div>
     <div class="row"><label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label></div>
     <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2)">
@@ -4535,11 +4555,17 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     vdxfId = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz";
     const collateralBtns = formEl.querySelectorAll(".collateral-toggle .ctog.selected");
     const autoFund = formEl.querySelector('[data-f="auto_fund"]')?.checked || false;
+    // Effective minimum on the wire = target × (1 - slippage/100). UI
+    // shows both inputs but the protocol payload only carries the single
+    // derived floor (cleaner spec, simpler match-time check).
+    const targetRatio = parseFloat(f("target_ratio")) || 0;
+    const slippagePct = parseFloat(f("slippage_pct")) || 0;
+    const minCollateralRatio = targetRatio * (1 - slippagePct / 100);
     payload = {
       version: 1,
       max_principal:        { currency: f("max_principal_currency"), amount: parseFloat(f("max_principal_amount")) },
       accepted_collateral:  Array.from(collateralBtns).map((b) => b.dataset.cur),
-      min_collateral_ratio: parseFloat(f("min_ratio")),
+      min_collateral_ratio: minCollateralRatio,
       rate:                 parseFloat(f("rate")),
       term_days:            parseInt(f("term_days"), 10),
       auto_fund:            autoFund,
