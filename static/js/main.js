@@ -49,6 +49,54 @@ function _ccyFqn(iaddr) {
   return c?.fqn || null;
 }
 
+// True when `ccy` (a wire-form i-address OR a legacy FQN string still
+// floating around in the GUI) refers to the chain's native VRSC. Form
+// values are now i-addresses; older paths still hand back "VRSC". Both
+// resolve to the same native-output branch in tx-building code.
+const VRSC_IADDR = "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV";
+function _isVrscNative(ccy) { return ccy === "VRSC" || ccy === VRSC_IADDR; }
+
+// Convert `vrscAmount` to `targetCcy` at current oracle price, walking
+// the same multi-route fallback the request-form collateral suggestion
+// uses. Returns the target-currency amount, or null when no route
+// exists. Identity case (target is VRSC) short-circuits to vrscAmount.
+async function oracleConvertVrscTo(vrscAmount, targetCcy) {
+  if (!vrscAmount || vrscAmount <= 0) return 0;
+  if (_isVrscNative(targetCcy)) return vrscAmount;
+  const VIAS = [null, "Bridge.vETH", "Bridge.vARRR", "Bridge.vDEX", "Pure"];
+  for (const via of VIAS) {
+    try {
+      const params = { currency: VRSC_IADDR, amount: vrscAmount, convertto: targetCcy };
+      if (via) params.via = via;
+      const q = await rpc("estimateconversion", [params]);
+      if (q?.estimatedcurrencyout && parseFloat(q.estimatedcurrencyout) > 0) {
+        return parseFloat(q.estimatedcurrencyout);
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// Inverse: convert `amount` of `sourceCcy` back into VRSC (the cap's
+// denomination). Used by the borrower's principal-cap validator and the
+// lender's auto-fund watcher.
+async function oracleConvertToVrsc(amount, sourceCcy) {
+  if (!amount || amount <= 0) return 0;
+  if (_isVrscNative(sourceCcy)) return amount;
+  const VIAS = [null, "Bridge.vETH", "Bridge.vARRR", "Bridge.vDEX", "Pure"];
+  for (const via of VIAS) {
+    try {
+      const params = { currency: sourceCcy, amount, convertto: VRSC_IADDR };
+      if (via) params.via = via;
+      const q = await rpc("estimateconversion", [params]);
+      if (q?.estimatedcurrencyout && parseFloat(q.estimatedcurrencyout) > 0) {
+        return parseFloat(q.estimatedcurrencyout);
+      }
+    } catch {}
+  }
+  return null;
+}
+
 // ── Currency canonicalization (SCHEMA.md §2 currency rule) ───────────
 // On the wire, every currency field in protocol payloads MUST be a Verus
 // i-address — never a FQN, never a bare local name, never the "VRSC"
@@ -131,18 +179,20 @@ async function canonicalizeCurrencyFields(payload) {
   if (Array.isArray(p.accepted_collateral)) {
     p.accepted_collateral = await Promise.all(p.accepted_collateral.map(canonicalizeCurrency));
   }
+  if (Array.isArray(p.lend_currencies)) {
+    p.lend_currencies = await Promise.all(p.lend_currencies.map(canonicalizeCurrency));
+  }
   if (Array.isArray(p.allowed_collateral_currencies)) {
     p.allowed_collateral_currencies = await Promise.all(p.allowed_collateral_currencies.map(canonicalizeCurrency));
   }
   return p;
 }
 
-// VDXF key transition: vrsc::contract.* → vcs::contract.*
-//
 // Canonical VDXF keys, all under the registered standard owner make.VRSC@
 // (iLWvRsiWVCEuFYhCSt2Qba7LxWksrgVerX). Names: make.vrsc::contract.<slug>.
-// Older `vcs::contract.*` and `vrsc::contract.*` entries that exist on chain
-// are deliberately NOT supported — pre-release test data only, no live users.
+// Earlier draft namespaces (`vrsc::contract.*`, `vcs::contract.*`) that
+// exist on chain are deliberately NOT supported — pre-release test data
+// only, no live users.
 const VDXF_LOAN_OFFER    = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz"; // make.vrsc::contract.loan.offer
 const VDXF_LOAN_REQUEST  = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5"; // make.vrsc::contract.loan.request
 const VDXF_LOAN_MATCH    = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U"; // make.vrsc::contract.loan.match
@@ -404,14 +454,15 @@ async function buildAndSignBorrowerTxA({
     const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
     const u = utxos.find((x) => x.txid === borrowerInputTxid && x.outputIndex === borrowerInputVout);
     if (!u) throw new Error(`UTXO ${borrowerInputTxid.slice(0, 16)}…:${borrowerInputVout} not found at ${borrowerR}`);
-    utxoAmount = collateralCurrency === "VRSC"
+    utxoAmount = _isVrscNative(collateralCurrency)
       ? u.satoshis / 1e8
-      : parseFloat(u.currencyvalues?.[collateralCurrency] ?? 0);
+      : parseFloat(u.currencyvalues?.[collateralCurrency] ?? u.currencyvalues?.[_ccyFqn(collateralCurrency) || ""] ?? 0);
   }
 
   // Resolve currency iaddrs for non-native principal/collateral
   const ccyIaddr = async (name) => {
-    if (name === "VRSC") return "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV";
+    if (_isVrscNative(name)) return VRSC_IADDR;
+    if (_IADDR_RE.test(name)) return name;
     return (await rpc("getcurrency", [name]))?.currencyid;
   };
   const principalCcyId  = await ccyIaddr(principalCurrency);
@@ -433,13 +484,13 @@ async function buildAndSignBorrowerTxA({
   // output 2 = borrower's change.
   // (Lender's input 0 is added later — we build with just borrower's input here.)
   const principalOutputKey = borrowerR;
-  const principalOutputVal = principalCurrency === "VRSC"
+  const principalOutputVal = _isVrscNative(principalCurrency)
     ? principalAmount
     : { [principalCcyId]: principalAmount };
-  const vaultOutputVal = collateralCurrency === "VRSC"
+  const vaultOutputVal = _isVrscNative(collateralCurrency)
     ? collateralAmount
     : { [collateralCcyId]: collateralAmount };
-  const changeOutputVal = collateralCurrency === "VRSC"
+  const changeOutputVal = _isVrscNative(collateralCurrency)
     ? change
     : { [collateralCcyId]: change };
 
@@ -663,7 +714,14 @@ function renderEntryDetail(meta, payload, idx) {
   if (meta.slug === "loan.request") {
     summary = `Borrow ${formatAmount(payload.principal)} · ${formatAmount(payload.collateral)} collateral · repay ${formatAmount(payload.repay)} / ${payload.term_days ?? "?"}d`;
   } else if (meta.slug === "loan.offer") {
-    summary = `Up to ${formatAmount(payload.max_principal)} · ≥${payload.min_collateral_ratio?.toFixed?.(2) ?? "?"}× collateral · ${payload.rate != null ? (payload.rate * 100).toFixed(1) + "%" : "?"} / ${payload.term_days ?? "?"}d`;
+    summary = (() => {
+      const maxStr = (payload.max_principal_vrsc != null)
+        ? `Up to ${payload.max_principal_vrsc} VRSC`
+        : (payload.max_principal ? `Up to ${formatAmount(payload.max_principal)}` : "—");
+      const lendStr = Array.isArray(payload.lend_currencies) && payload.lend_currencies.length
+        ? ` lends ${payload.lend_currencies.map(displayCurrency).join(", ")}` : "";
+      return `${maxStr}${lendStr} · ${payload.min_collateral_ratio?.toFixed?.(2) ?? "?"}× collateral · ${payload.rate != null ? (payload.rate * 100).toFixed(1) + "%" : "?"} / ${payload.term_days ?? "?"}d`;
+    })();
   } else if (meta.slug === "loan.status") {
     summary = `${payload.role} · ${formatAmount(payload.principal)} → repay ${formatAmount(payload.repay)} · maturity block ${payload.maturity_block ?? "?"} · ${payload.settled ? "SETTLED" : "active"}`;
   } else {
@@ -772,11 +830,18 @@ function renderOfferForm() {
     <div class="post-box">
       <h3>Post a loan offer from this identity</h3>
       <div class="row">
-        <label style="flex:1">Max principal<input type="number" data-f="max_principal_amount" value="100" step="0.01" /></label>
-        <label style="flex:1">Currency<select data-f="max_principal_currency">${currencyOptions("VRSC")}</select></label>
+        <label style="flex:1">Max principal (VRSC)<input type="number" data-f="max_principal_vrsc" value="100" step="0.01" /></label>
       </div>
-      <div>
-        <label>Accepted collateral (click to toggle)</label>
+      <div style="margin-top:8px">
+        <label>Will lend (click to toggle)</label>
+        <div class="lend-toggle" data-f="lend_currencies">
+          ${CURRENCIES.map((c) => `
+            <button type="button" class="ctog ${c.fqn === "VRSC" || c.fqn === "DAI.vETH" ? "selected" : ""}" data-cur="${c.iaddr}">${c.fqn}</button>
+          `).join("")}
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        <label>Will accept as collateral (click to toggle)</label>
         <div class="collateral-toggle" data-f="accepted_collateral">
           ${CURRENCIES.map((c) => `
             <button type="button" class="ctog ${c.fqn === "VRSC" || c.fqn === "DAI.vETH" ? "selected" : ""}" data-cur="${c.iaddr}">${c.fqn}</button>
@@ -826,12 +891,13 @@ document.getElementById("ids-list")?.addEventListener("click", async (ev) => {
   } else if (do_ === "preview-offer") {
     slug = "loan.offer";
     vdxfId = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz";
-    const collateralBtns = form.querySelectorAll(".collateral-toggle .ctog.selected");
-    const acceptedCollateral = Array.from(collateralBtns).map((b) => b.dataset.cur);
+    const lendBtns           = form.querySelectorAll(".lend-toggle .ctog.selected");
+    const collateralBtns     = form.querySelectorAll(".collateral-toggle .ctog.selected");
     payload = {
       version: 1,
-      max_principal:        { currency: f("max_principal_currency"), amount: parseFloat(f("max_principal_amount")) },
-      accepted_collateral:  acceptedCollateral,
+      max_principal_vrsc:   parseFloat(f("max_principal_vrsc")) || 0,
+      lend_currencies:      Array.from(lendBtns).map((b) => b.dataset.cur),
+      accepted_collateral:  Array.from(collateralBtns).map((b) => b.dataset.cur),
       min_collateral_ratio: parseFloat(f("min_ratio")),
       rate:                 parseFloat(f("rate")),
       term_days:            parseInt(f("term_days"), 10),
@@ -2453,14 +2519,20 @@ function renderMarketOffer(r, mySet, myMap, acting) {
   // from the offer's terms (max_principal as ceiling, min_collateral_ratio
   // as the principal→collateral multiplier).
   const prefillName = r.fullyQualifiedName || (r.name ? r.name + "@" : r.iaddr);
+  // New schema: max_principal_vrsc + lend_currencies. Legacy: max_principal
+  // { currency, amount } — coerce a single-entry lend_currencies for display.
+  const lendCcys = Array.isArray(r.lend_currencies) && r.lend_currencies.length
+    ? r.lend_currencies
+    : (r.max_principal?.currency ? [r.max_principal.currency] : []);
+  const maxVrsc = (r.max_principal_vrsc != null) ? r.max_principal_vrsc : null;
   return `
     <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz"
          data-offer-fqn="${escapeHtml(prefillName)}"
          data-offer-rate="${r.rate ?? ""}" data-offer-term="${r.term_days ?? ""}"
-         data-offer-max-principal="${(r.max_principal && r.max_principal.amount) || ""}"
-         data-offer-principal-ccy="${escapeHtml((r.max_principal && r.max_principal.currency) || "")}"
+         data-offer-max-vrsc="${maxVrsc ?? ""}"
+         data-offer-lend="${escapeHtml(lendCcys.join(","))}"
          data-offer-min-ratio="${r.min_collateral_ratio ?? ""}"
-         data-offer-target-ratio="${r.target_collateral_ratio ?? r.min_collateral_ratio ?? ""}"
+         data-offer-slippage-pct="${r.slippage_pct ?? ""}"
          data-offer-collaterals="${escapeHtml((r.accepted_collateral || []).join(","))}">
       <div class="row">
         <strong style="flex:1">${escapeHtml(prefillName)}</strong>
@@ -2468,9 +2540,10 @@ function renderMarketOffer(r, mySet, myMap, acting) {
         ${isActing ? `<span class="badge yours" style="margin-left:6px">yours</span>` : mine ? `<span class="badge muted" style="margin-left:6px">local</span>` : ""}
       </div>
       <div class="kv">
-        <div><span class="k">max</span><span class="v">${formatAmount(r.max_principal)}</span></div>
+        <div><span class="k">max</span><span class="v">${maxVrsc != null ? `${maxVrsc} VRSC` : formatAmount(r.max_principal)}</span></div>
+        <div><span class="k">lends</span><span class="v">${escapeHtml(lendCcys.map(displayCurrency).join(", ") || "—")}</span></div>
         <div><span class="k">accepts</span><span class="v">${escapeHtml((r.accepted_collateral || []).map(displayCurrency).join(", ") || "—")}</span></div>
-        <div><span class="k">min ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}×</span></div>
+        <div><span class="k">ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}×</span></div>
         <div><span class="k">rate</span><span class="v">${r.rate != null ? (r.rate * 100).toFixed(1) + "%" : "?"}</span></div>
         <div><span class="k">term</span><span class="v">${escapeHtml(r.term_days ?? "?")} days</span></div>
       </div>
@@ -2646,7 +2719,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
     }
     const principalCcy = requestPayload.principal?.currency;
     const principalAmt = parseFloat(requestPayload.principal?.amount ?? 0);
-    if (principalCcy === "VRSC") {
+    if (_isVrscNative(principalCcy)) {
       if (Math.round((principalOut?.value ?? 0) * 1e8) !== Math.round(principalAmt * 1e8)) {
         errors.push(`Tx-A principal amount ${principalOut?.value} VRSC — expected ${principalAmt}`);
       }
@@ -2654,7 +2727,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
       const cv = principalOut?.scriptPubKey?.reserveoutput?.currencyvalues || {};
       const got = parseFloat(Object.values(cv)[0] ?? 0);
       if (Math.round(got * 1e8) !== Math.round(principalAmt * 1e8)) {
-        errors.push(`Tx-A principal amount ${got} — expected ${principalAmt} ${principalCcy}`);
+        errors.push(`Tx-A principal amount ${got} — expected ${principalAmt} ${displayCurrency(principalCcy)}`);
       }
     }
 
@@ -2668,7 +2741,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
       const collateralCcy = requestPayload.collateral?.currency;
       const collateralAmt = parseFloat(requestPayload.collateral?.amount ?? 0);
       const vaultOut = decA.vout[vaultVout];
-      if (collateralCcy === "VRSC") {
+      if (_isVrscNative(collateralCcy)) {
         if (Math.round((vaultOut?.value ?? 0) * 1e8) !== Math.round(collateralAmt * 1e8)) {
           errors.push(`Tx-A vault holds ${vaultOut?.value} VRSC — expected ${collateralAmt}`);
         }
@@ -2676,7 +2749,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
         const cv = vaultOut?.scriptPubKey?.reserveoutput?.currencyvalues || {};
         const got = parseFloat(Object.values(cv)[0] ?? 0);
         if (Math.round(got * 1e8) !== Math.round(collateralAmt * 1e8)) {
-          errors.push(`Tx-A vault holds ${got} — expected ${collateralAmt} ${collateralCcy}`);
+          errors.push(`Tx-A vault holds ${got} — expected ${collateralAmt} ${displayCurrency(collateralCcy)}`);
         }
       }
     }
@@ -2689,7 +2762,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
     }
     const repayCcy = requestPayload.repay?.currency;
     const repayAmt = parseFloat(requestPayload.repay?.amount ?? 0);
-    if (repayCcy === "VRSC") {
+    if (_isVrscNative(repayCcy)) {
       if (Math.round((repayOut?.value ?? 0) * 1e8) !== Math.round(repayAmt * 1e8)) {
         errors.push(`Tx-Repay output 0 amount ${repayOut?.value} VRSC — expected ${repayAmt}`);
       }
@@ -2697,7 +2770,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
       const cv = repayOut?.scriptPubKey?.reserveoutput?.currencyvalues || {};
       const got = parseFloat(Object.values(cv)[0] ?? 0);
       if (Math.round(got * 1e8) !== Math.round(repayAmt * 1e8)) {
-        errors.push(`Tx-Repay output 0 amount ${got} — expected ${repayAmt} ${repayCcy}`);
+        errors.push(`Tx-Repay output 0 amount ${got} — expected ${repayAmt} ${displayCurrency(repayCcy)}`);
       }
     }
     if (decRepay.vin[0]?.txid !== txAtxid || decRepay.vin[0]?.vout !== vaultVout) {
@@ -2712,7 +2785,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
     }
     const collateralCcy = requestPayload.collateral?.currency;
     const collateralAmt = parseFloat(requestPayload.collateral?.amount ?? 0);
-    if (collateralCcy === "VRSC") {
+    if (_isVrscNative(collateralCcy)) {
       if (Math.round((bOut?.value ?? 0) * 1e8) !== Math.round(collateralAmt * 1e8)) {
         errors.push(`Tx-B output 0 amount ${bOut?.value} VRSC — expected ${collateralAmt}`);
       }
@@ -2720,7 +2793,7 @@ async function verifyMatchSafety(matchPayload, requestPayload, borrowerIaddr) {
       const cv = bOut?.scriptPubKey?.reserveoutput?.currencyvalues || {};
       const got = parseFloat(Object.values(cv)[0] ?? 0);
       if (Math.round(got * 1e8) !== Math.round(collateralAmt * 1e8)) {
-        errors.push(`Tx-B output 0 amount ${got} — expected ${collateralAmt} ${collateralCcy}`);
+        errors.push(`Tx-B output 0 amount ${got} — expected ${collateralAmt} ${displayCurrency(collateralCcy)}`);
       }
     }
     const maturity = matchPayload.maturity_block ?? 0;
@@ -2748,39 +2821,44 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     // lender iaddr + sensible defaults pulled from the offer terms.
     ev.stopPropagation();
     const lenderIa = row.dataset.iaddr;
-    const offerCcy = row.dataset.offerPrincipalCcy || "VRSC";
-    const offerMaxAmt = parseFloat(row.dataset.offerMaxPrincipal || "5") || 5;
-    const offerMinRatio    = parseFloat(row.dataset.offerMinRatio || "2") || 2;
-    // Borrower posts at TARGET (what the lender actually wants); lender's
-    // auto-fund accepts down to MIN (target × (1 - slippage)). For legacy
-    // offers without target_collateral_ratio, fall back to min — the
-    // borrower over-commits by the slippage cushion but the post still
-    // matches.
-    const offerTargetRatio = parseFloat(row.dataset.offerTargetRatio || row.dataset.offerMinRatio || "2") || 2;
+    const offerMaxVrsc = parseFloat(row.dataset.offerMaxVrsc || "0") || 0;
+    // data-offer-lend is populated even for legacy offers — the row
+    // renderer coerces `max_principal.currency` into a single-entry list
+    // before serializing.
+    const lendCcys = (row.dataset.offerLend || "").split(",").filter(Boolean);
+    // Borrower commits at the lender's stated min_collateral_ratio. The
+    // lender's auto-fund drift cushion (slippage_pct) is derived at
+    // acceptance time and never surfaces in the borrower's pre-fill.
+    const offerRatio  = parseFloat(row.dataset.offerMinRatio || "2") || 2;
     const offerTerm   = parseInt(row.dataset.offerTerm || "30") || 30;
     const offerRate   = parseFloat(row.dataset.offerRate || "0.01");
     const offerCols   = (row.dataset.offerCollaterals || "").split(",").filter(Boolean);
-    const principal = Math.min(offerMaxAmt, 5);                  // start small by default
-    const collateralCcy = offerCols[0] || "VRSC";
-    const collateral = +(principal * offerTargetRatio).toFixed(8);
+    // Default principal currency = first in lend list (typically VRSC);
+    // principal amount = min(5, max in that currency at oracle price).
+    const principalCcy = lendCcys[0] || VRSC_IADDR;
+    const principalCapInCcy = await oracleConvertVrscTo(offerMaxVrsc, principalCcy).catch(() => offerMaxVrsc);
+    const principal    = Math.min(principalCapInCcy || 5, 5);
+    const collateralCcy = offerCols[0] || VRSC_IADDR;
+    const collateral   = +(principal * offerRatio).toFixed(8);
     // Rate is interpreted as a flat percentage for the term (not APR).
     // Lender posting "1% over 30 days" means repay = principal × 1.01.
-    // Same lender posting "1% over 7 days" also means repay × 1.01 — the
-    // term doesn't pro-rate; the lender named their price for THIS duration.
     const repay = +(principal * (1 + offerRate)).toFixed(8);
     await openMarketPostForm("request", {
       target_lender: lenderIa,
       target_lender_label: row.dataset.offerFqn || lenderIa,
       principal_amount: principal,
-      principal_currency: offerCcy,
+      principal_currency: principalCcy,
       collateral_amount: collateral,
       collateral_currency: collateralCcy,
       repay_amount: repay,
       term_days: offerTerm,
-      // Borrower's GUI uses this for the oracle suggestion (post at target);
-      // form validation also gates Preview on actual/principal ≥ this.
-      min_collateral_ratio: offerTargetRatio,
-      accepted_collateral: offerCols,
+      // Borrower's GUI uses these for validation: ratio for collateral
+      // check, max_vrsc for principal cap, lend/accept lists for dropdown
+      // restriction.
+      min_collateral_ratio: offerRatio,
+      max_principal_vrsc:   offerMaxVrsc,
+      lend_currencies:      lendCcys,
+      accepted_collateral:  offerCols,
     });
     return;
   }
@@ -3114,7 +3192,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       let exact = null;
       {
         btn.textContent = "Splitting UTXO via sendcurrency…";
-        const out = principalCcy === "VRSC"
+        const out = _isVrscNative(principalCcy)
           ? [{ address: lenderR, amount: principalAmt }]
           : [{ currency: principalCcy, amount: principalAmt, address: lenderR }];
         const opid = await rpc("sendcurrency", [lenderR, out]);
@@ -3141,7 +3219,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           if (!addrs.includes(lenderR)) continue;
           const cv = spk.reserveoutput?.currencyvalues || {};
           const cvKeys = Object.keys(cv);
-          if (principalCcy !== "VRSC") {
+          if (!_isVrscNative(principalCcy)) {
             // Cryptocondition output, single currency, exact amount
             if (o.valueSat === 0 && cvKeys.length === 1 && parseFloat(Object.values(cv)[0]) === principalAmt) {
               splitVout = i; break;
@@ -3211,13 +3289,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // Borrower at accept time adds borrower-half + repayment input + outputs.
       const repayCcy = principalCcy; // repay is in principal currency by convention
       const repayAmt = parseFloat(ds.repayAmount);
-      const repayCcyId = repayCcy === "VRSC"
-        ? "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV"
-        : (await rpc("getcurrency", [repayCcy]))?.currencyid;
+      const repayCcyId = _isVrscNative(repayCcy)
+        ? VRSC_IADDR
+        : (_IADDR_RE.test(repayCcy) ? repayCcy : (await rpc("getcurrency", [repayCcy]))?.currencyid);
       if (!repayCcyId) throw new Error(`could not resolve currency id for ${repayCcy}`);
       const tipNow = await rpc("getblockcount");
       const matchExpiry = tipNow + 720;
-      const repayOutputs = repayCcy === "VRSC"
+      const repayOutputs = _isVrscNative(repayCcy)
         ? { [lenderR]: repayAmt }
         : { [lenderR]: { [repayCcyId]: repayAmt } };
       const txRepayUnsigned = await rpc("createrawtransaction", [
@@ -3245,10 +3323,10 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       const termDays = parseInt(ds.termDays || "30", 10);
       const maturityBlock = tipNow + termDays * 1440;
       const collateralCcy = ds.collateralCurrency;
-      const collateralCcyId = collateralCcy === "VRSC"
-        ? "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV"
-        : (await rpc("getcurrency", [collateralCcy]))?.currencyid;
-      const txBOutputs = collateralCcy === "VRSC"
+      const collateralCcyId = _isVrscNative(collateralCcy)
+        ? VRSC_IADDR
+        : (_IADDR_RE.test(collateralCcy) ? collateralCcy : (await rpc("getcurrency", [collateralCcy]))?.currencyid);
+      const txBOutputs = _isVrscNative(collateralCcy)
         ? { [lenderR]: collateralAmt }
         : { [lenderR]: { [collateralCcyId]: collateralAmt } };
       const txBUnsigned = await rpc("createrawtransaction", [
@@ -3981,17 +4059,33 @@ async function openMarketPostForm(kind, prefill) {
     if (prefill.min_collateral_ratio != null) {
       formEl.dataset.minCollateralRatio = String(prefill.min_collateral_ratio);
     }
+    // Stash the offer's VRSC-denominated cap so runFormValidation can
+    // gate the principal amount against it (oracle-converted to whichever
+    // currency the borrower picks).
+    if (prefill.max_principal_vrsc != null) {
+      formEl.dataset.maxPrincipalVrsc = String(prefill.max_principal_vrsc);
+    }
+    // Restrict the principal_currency dropdown to the lender's
+    // lend_currencies set. Borrower can only borrow what's on offer.
+    if (Array.isArray(prefill.lend_currencies) && prefill.lend_currencies.length > 0) {
+      const allowed = new Set(prefill.lend_currencies);
+      const sel = formEl.querySelector('[data-f="principal_currency"]');
+      if (sel) {
+        for (const opt of Array.from(sel.options)) {
+          if (!allowed.has(opt.value) && !allowed.has(opt.textContent.trim())) opt.remove();
+        }
+        if (sel.options.length === 0) sel.innerHTML = currencyOptions("VRSC");
+      }
+    }
     // Restrict the collateral_currency dropdown to currencies the lender's
-    // offer actually accepts. Match BOTH i-address (current SCHEMA §2)
-    // AND FQN (legacy entries) so old + new offers both filter correctly.
-    // Option values are now i-addresses; option text is FQN.
+    // offer accepts. Match BOTH i-address (current SCHEMA §2) AND FQN
+    // (legacy entries) so old + new offers both filter correctly. Option
+    // values are i-addresses; option text is FQN.
     if (Array.isArray(prefill.accepted_collateral) && prefill.accepted_collateral.length > 0) {
       const allowed = new Set(prefill.accepted_collateral);
       const sel = formEl.querySelector('[data-f="collateral_currency"]');
       if (sel) {
         for (const opt of Array.from(sel.options)) {
-          // Keep option if its i-address value OR its FQN label is in the
-          // allowed set. Covers both wire formats.
           if (!allowed.has(opt.value) && !allowed.has(opt.textContent.trim())) opt.remove();
         }
         if (sel.options.length === 0) {
@@ -4085,6 +4179,40 @@ function runFormValidation(formEl) {
       : `<span style="color:var(--bad)">✗ collateral ratio ${ratio.toFixed(2)}× &lt; lender's required ${minRatio.toFixed(2)}×</span>`
     );
   }
+  // Check 3 (async): principal cap. The lender's offer caps the loan in
+  // VRSC; convert the request's principal back to VRSC at oracle price and
+  // compare. We render synchronously now with a placeholder, then async
+  // resolve and patch the line in place.
+  const maxVrsc = parseFloat(formEl.dataset.maxPrincipalVrsc || "0");
+  let capFailNow = false;  // synchronous "known-bad" state for preview gating
+  if (maxVrsc > 0 && principalAmt > 0) {
+    const principalCcy = formEl.querySelector('[data-f="principal_currency"]')?.value || "VRSC";
+    // Synchronous best-effort: when borrowing VRSC, no oracle needed.
+    if (_isVrscNative(principalCcy)) {
+      capFailNow = principalAmt > maxVrsc + 1e-9;
+      messages.push(capFailNow
+        ? `<span style="color:var(--bad)">✗ over lender's ${maxVrsc} VRSC cap (asking ${principalAmt} VRSC)</span>`
+        : `<span style="color:var(--ok)">✓ within lender's ${maxVrsc} VRSC cap</span>`);
+    } else {
+      messages.push(`<span class="muted" data-cap-line>checking principal cap…</span>`);
+      // Async refresh of the cap line — fire-and-forget; on resolution
+      // mutate the existing node so we don't re-clobber other messages.
+      oracleConvertToVrsc(principalAmt, principalCcy).then((vrscEquiv) => {
+        const target = out.querySelector("[data-cap-line]");
+        if (!target) return;
+        if (vrscEquiv == null) {
+          target.outerHTML = `<span class="muted">⚠ no oracle route ${escapeHtml(displayCurrency(principalCcy))} → VRSC — can't verify lender's cap</span>`;
+          return;
+        }
+        const over = vrscEquiv > maxVrsc + 1e-9;
+        target.outerHTML = over
+          ? `<span style="color:var(--bad)">✗ over lender's ${maxVrsc} VRSC cap (asking ${vrscEquiv.toFixed(4)} VRSC equivalent)</span>`
+          : `<span style="color:var(--ok)">✓ within lender's ${maxVrsc} VRSC cap (≈ ${vrscEquiv.toFixed(4)} VRSC)</span>`;
+        const preview = formEl.querySelector('[data-mp-do="preview-request"]');
+        if (preview && over) { preview.disabled = true; preview.title = "Principal over lender's VRSC cap"; }
+      }).catch(() => {});
+    }
+  }
   out.innerHTML = messages.join("<br>");
   // Suggestion div is a SIBLING of .form-validation, not a child. Putting
   // it inside out.innerHTML caused a race: applySuggestedCollateral fires
@@ -4101,13 +4229,14 @@ function runFormValidation(formEl) {
   // Color the R-balance line based on the collateral check.
   if (balLine) balLine.style.color = collOk ? "var(--ok)" : "var(--bad)";
 
-  // Disable Preview & sign on hard-fail (insufficient balance OR ratio under).
+  // Disable Preview & sign on hard-fail (insufficient balance OR ratio OR cap).
   const preview = formEl.querySelector('[data-mp-do="preview-request"]');
   const ratioFail = (minRatio > 0 && principalAmt > 0 && (collAmt / principalAmt) < minRatio - 1e-9);
   if (preview) {
-    preview.disabled = !collOk || ratioFail;
+    preview.disabled = !collOk || ratioFail || capFailNow;
     preview.title = !collOk ? "Insufficient collateral balance"
                   : ratioFail ? "Collateral ratio below lender's minimum"
+                  : capFailNow ? "Principal over lender's VRSC cap"
                   : "";
   }
 
@@ -4224,19 +4353,19 @@ document.addEventListener("click", (ev) => {
   collInput.dispatchEvent(new Event("input", { bubbles: true }));
 });
 
-// Live recalc of the offer form's "Effective minimum on wire" hint as the
-// lender adjusts target_ratio / slippage_pct. min_collateral_ratio on the
-// wire = target × (1 - slippage/100). Delegation-based so it survives
+// Live recalc of the offer form's auto-fund accept floor hint as the
+// lender adjusts min_ratio / slippage_pct. Accept floor = ratio × (1 −
+// slippage/100); not stored on the wire. Delegation-based so it survives
 // innerHTML re-renders of the form panel.
 document.addEventListener("input", (ev) => {
   const t = ev.target;
-  if (!t.matches?.('[data-f="target_ratio"], [data-f="slippage_pct"]')) return;
+  if (!t.matches?.('[data-f="min_ratio"], [data-f="slippage_pct"]')) return;
   const form = t.closest('#mp-post-form, .post-box');
   if (!form) return;
-  const tgt = parseFloat(form.querySelector('[data-f="target_ratio"]')?.value) || 0;
+  const m   = parseFloat(form.querySelector('[data-f="min_ratio"]')?.value) || 0;
   const slp = parseFloat(form.querySelector('[data-f="slippage_pct"]')?.value) || 0;
   const out = form.querySelector('.effective-min-display code');
-  if (out) out.textContent = `${(tgt * (1 - slp / 100)).toFixed(4)}×`;
+  if (out) out.textContent = `${(m * (1 - slp / 100)).toFixed(4)}×`;
 });
 
 // Smart UTXO reuse: scan the wallet's locked UTXOs for one at borrowerR
@@ -4291,13 +4420,13 @@ async function findReusableSplitUtxo(iaddr, borrowerR, currency, splitAmount) {
     if (!addrs.includes(borrowerR)) continue;
     const cv = out.scriptPubKey?.reserveoutput?.currencyvalues || {};
     const cvKeys = Object.keys(cv);
-    if (currency === "VRSC") {
+    if (_isVrscNative(currency)) {
       if (cvKeys.length === 0 && Math.abs((out.value || 0) - splitAmount) < 1e-7) {
         return { txid: u.txid, vout: u.vout, amount: out.value };
       }
     } else {
       // Non-native: single-currency UTXO with no bundled VRSC.
-      const expectedKeys = [currency, CURRENCY_NAME_TO_IADDR[currency]].filter(Boolean);
+      const expectedKeys = [currency, CURRENCY_NAME_TO_IADDR[currency], _ccyFqn(currency)].filter(Boolean);
       if ((out.valueSat ?? Math.round(out.value * 1e8)) === 0 && cvKeys.length === 1 && expectedKeys.includes(cvKeys[0])) {
         const amt = parseFloat(Object.values(cv)[0]);
         if (Math.abs(amt - splitAmount) < 1e-7) return { txid: u.txid, vout: u.vout, amount: amt };
@@ -4393,23 +4522,31 @@ async function populateCollateralUtxoPicker(formEl, rAddr, collateralCurrency, c
 function renderOfferFormBody() {
   return `
     <div class="row">
-      <label style="flex:1">Max principal<input type="number" data-f="max_principal_amount" value="100" step="0.01" /></label>
-      <label style="flex:1">Currency<select data-f="max_principal_currency">${currencyOptions("VRSC")}</select></label>
+      <label style="flex:1">Max principal (VRSC)<input type="number" data-f="max_principal_vrsc" value="100" step="0.01" /></label>
     </div>
-    <div>
-      <label>Accepted collateral (click to toggle)</label>
+    <div class="muted" style="font-size:11px;margin-top:-4px">
+      Cap denominated in VRSC. Borrower requests in any of the currencies below convert to VRSC at oracle price and must stay under this cap.
+    </div>
+    <div style="margin-top:8px">
+      <label>Will lend (click to toggle)</label>
+      <div class="lend-toggle" data-f="lend_currencies">
+        ${CURRENCIES.map((c) => `<button type="button" class="ctog ${c.fqn === "VRSC" || c.fqn === "DAI.vETH" ? "selected" : ""}" data-cur="${c.iaddr}">${c.fqn}</button>`).join("")}
+      </div>
+    </div>
+    <div style="margin-top:8px">
+      <label>Will accept as collateral (click to toggle)</label>
       <div class="collateral-toggle" data-f="accepted_collateral">
         ${CURRENCIES.map((c) => `<button type="button" class="ctog ${c.fqn === "VRSC" || c.fqn === "DAI.vETH" ? "selected" : ""}" data-cur="${c.iaddr}">${c.fqn}</button>`).join("")}
       </div>
     </div>
     <div class="row" style="margin-top:8px">
-      <label style="flex:1">Target ratio<input type="number" data-f="target_ratio" value="2" step="0.1" /></label>
+      <label style="flex:1">Min collateral ratio<input type="number" data-f="min_ratio" value="2" step="0.1" /></label>
       <label style="flex:1">Slippage tolerance %<input type="number" data-f="slippage_pct" value="1" step="0.5" /></label>
       <label style="flex:1">Rate (decimal)<input type="number" data-f="rate" value="0.01" step="0.001" /></label>
     </div>
     <div class="muted" style="font-size:11px;margin-top:-4px">
-      Effective minimum on wire: <span class="effective-min-display"><code>1.9800×</code></span>
-      <span class="muted">— what auto-fund will accept after price drift</span>
+      Auto-fund accept floor: <span class="effective-min-display"><code>1.9800×</code></span>
+      <span class="muted">— derived as ratio × (1 − slippage%); never displayed to the borrower</span>
     </div>
     <div class="row"><label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label></div>
     <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2)">
@@ -4548,7 +4685,7 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       previewEl.style.display = "block";
       let splitTxid;
       try {
-        const out = collateralCurrency === "VRSC"
+        const out = _isVrscNative(collateralCurrency)
           ? [{ address: borrowerR, amount: splitAmount }]
           : [{ currency: collateralCurrency, amount: splitAmount, address: borrowerR }];
         const opid = await rpc("sendcurrency", [borrowerR, out]);
@@ -4573,14 +4710,14 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
         if (!addrs.includes(borrowerR)) continue;
         const cv = spk.reserveoutput?.currencyvalues || {};
         const cvKeys = Object.keys(cv);
-        if (collateralCurrency === "VRSC") {
+        if (_isVrscNative(collateralCurrency)) {
           if (cvKeys.length === 0 && Math.abs((o.value || 0) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
         } else {
           if (o.valueSat === 0 && cvKeys.length === 1 && Math.abs(parseFloat(Object.values(cv)[0]) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
         }
       }
       if (borrowerInputVout < 0) {
-        previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ split tx didn't produce a clean ${escapeHtml(collateralCurrency)} output</div>`;
+        previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ split tx didn't produce a clean ${escapeHtml(displayCurrency(collateralCurrency))} output</div>`;
         return;
       }
       borrowerInputTxid = splitTxid;
@@ -4655,28 +4792,29 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
   } else if (action === "preview-offer") {
     slug = "loan.offer";
     vdxfId = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz";
+    const lendBtns       = formEl.querySelectorAll(".lend-toggle .ctog.selected");
     const collateralBtns = formEl.querySelectorAll(".collateral-toggle .ctog.selected");
     const autoFund = formEl.querySelector('[data-f="auto_fund"]')?.checked || false;
-    // Two ratio fields on the wire:
-    //   target_collateral_ratio — what the lender ACTUALLY wants (borrower
-    //                             should post at this multiple)
-    //   min_collateral_ratio    — what the lender will auto-accept after
-    //                             allowing for price drift (target × (1 - slippage))
-    // Borrower GUIs read target_collateral_ratio for the suggestion; lender
-    // auto-fund matchers read min_collateral_ratio for the accept gate.
-    const targetRatio = parseFloat(f("target_ratio")) || 0;
+    // Single ratio on the wire:
+    //   min_collateral_ratio — what the borrower must post (and what's
+    //                          displayed everywhere). The lender's auto-fund
+    //                          accept floor is DERIVED at runtime as
+    //                          min_ratio × (1 − slippage_pct/100), so no
+    //                          drift-cushion value ever leaks into the
+    //                          public offer payload.
+    const minRatio    = parseFloat(f("min_ratio")) || 0;
     const slippagePct = parseFloat(f("slippage_pct")) || 0;
-    const minCollateralRatio = targetRatio * (1 - slippagePct / 100);
     payload = {
       version: 1,
-      max_principal:           { currency: f("max_principal_currency"), amount: parseFloat(f("max_principal_amount")) },
-      accepted_collateral:     Array.from(collateralBtns).map((b) => b.dataset.cur),
-      target_collateral_ratio: targetRatio,
-      min_collateral_ratio:    minCollateralRatio,
-      rate:                    parseFloat(f("rate")),
-      term_days:               parseInt(f("term_days"), 10),
-      auto_fund:               autoFund,
-      active:                  true,
+      max_principal_vrsc:   parseFloat(f("max_principal_vrsc")) || 0,
+      lend_currencies:      Array.from(lendBtns).map((b) => b.dataset.cur),
+      accepted_collateral:  Array.from(collateralBtns).map((b) => b.dataset.cur),
+      min_collateral_ratio: minRatio,
+      slippage_pct:         slippagePct,
+      rate:                 parseFloat(f("rate")),
+      term_days:            parseInt(f("term_days"), 10),
+      auto_fund:            autoFund,
+      active:               true,
     };
   } else {
     return;
@@ -5027,19 +5165,33 @@ async function enrichActiveLoanBalances() {
       // both to get the true post-Tx-A balance the moment Tx-A is broadcast.
       const VRSC_ID = "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV";
       const cb = {};
+      // Reserve outputs (cryptoconditions) carry the same native VRSC
+      // amount in BOTH `satoshis` and `currencyvalues[VRSC]` — counting
+      // each path independently double-counts. Walk `currencyvalues` if
+      // present (covers VRSC + reserves in one pass); otherwise fall
+      // back to `satoshis` for plain P2PKH VRSC UTXOs.
       const utxos = await rpc('getaddressutxos', [{ addresses: [r], currencynames: false }]);
       for (const u of (utxos || [])) {
-        if (u.satoshis) cb[VRSC_ID] = (cb[VRSC_ID] || 0) + (u.satoshis / 1e8);
-        for (const [ccyId, amt] of Object.entries(u.currencyvalues || {})) {
-          cb[ccyId] = (cb[ccyId] || 0) + parseFloat(amt);
+        const cv = u.currencyvalues || {};
+        if (Object.keys(cv).length) {
+          for (const [ccyId, amt] of Object.entries(cv)) {
+            cb[ccyId] = (cb[ccyId] || 0) + parseFloat(amt);
+          }
+        } else if (u.satoshis) {
+          cb[VRSC_ID] = (cb[VRSC_ID] || 0) + (u.satoshis / 1e8);
         }
       }
-      // Mempool deltas — positive = received, negative = spent.
+      // Mempool deltas — positive = received, negative = spent. Same
+      // double-count caveat applies; prefer currencyvalues when present.
       const mempool = await rpc('getaddressmempool', [{ addresses: [r] }]).catch(() => []);
       for (const m of (mempool || [])) {
-        if (m.satoshis) cb[VRSC_ID] = (cb[VRSC_ID] || 0) + (m.satoshis / 1e8);
-        for (const [ccyId, amt] of Object.entries(m.currencyvalues || {})) {
-          cb[ccyId] = (cb[ccyId] || 0) + parseFloat(amt);
+        const cv = m.currencyvalues || {};
+        if (Object.keys(cv).length) {
+          for (const [ccyId, amt] of Object.entries(cv)) {
+            cb[ccyId] = (cb[ccyId] || 0) + parseFloat(amt);
+          }
+        } else if (m.satoshis) {
+          cb[VRSC_ID] = (cb[VRSC_ID] || 0) + (m.satoshis / 1e8);
         }
       }
       const bal = { balance: Math.round((cb[VRSC_ID] || 0) * 1e8), currencybalance: cb };
@@ -5344,7 +5496,7 @@ async function enrichActiveLoanBalances() {
       //     repayAmt of the loan currency for the lender's output, AND
       //     0.0001 VRSC fully consumed as the network fee.
       const FEE_VRSC = 0.0001;
-      const splitOut = repayCcy === "VRSC"
+      const splitOut = _isVrscNative(repayCcy)
         ? [{ address: borrowerR, amount: repayAmt + FEE_VRSC }]
         : [
             { currency: repayCcy, amount: repayAmt, address: borrowerR },
@@ -5362,7 +5514,7 @@ async function enrichActiveLoanBalances() {
 
       // Find clean UTXO(s) in the split tx (mempool).
       const splitTx = await rpc("getrawtransaction", [splitTxid, 1]);
-      const repaySats = repayCcy === "VRSC"
+      const repaySats = _isVrscNative(repayCcy)
         ? Math.round((repayAmt + FEE_VRSC) * 1e8)
         : Math.round(repayAmt * 1e8);
       const feeSats = Math.round(FEE_VRSC * 1e8);
@@ -5374,7 +5526,7 @@ async function enrichActiveLoanBalances() {
         if (!(spk.addresses || []).includes(borrowerR)) continue;
         const cv = spk.reserveoutput?.currencyvalues || {};
         const cvKeys = Object.keys(cv);
-        if (repayCcy === "VRSC") {
+        if (_isVrscNative(repayCcy)) {
           if (cvKeys.length === 0 && o.valueSat === repaySats) { splitVout = i; break; }
         } else {
           if (splitVout < 0 && o.valueSat === 0 && cvKeys.length === 1 &&
@@ -5387,7 +5539,7 @@ async function enrichActiveLoanBalances() {
         }
       }
       if (splitVout < 0) throw new Error("split tx didn't produce a clean repayment output");
-      if (repayCcy !== "VRSC" && feeVout < 0) throw new Error("split tx didn't produce a clean VRSC fee output");
+      if (!_isVrscNative(repayCcy) && feeVout < 0) throw new Error("split tx didn't produce a clean VRSC fee output");
 
       btn.textContent = "Extending Tx-Repay…";
       // Extend Tx-Repay. SIGHASH_SINGLE|ANYONECANPAY on input 0 (vault)
@@ -5396,18 +5548,18 @@ async function enrichActiveLoanBalances() {
       const tx = _parseTx(txRepayHex);
       const txidLE = _hexToBytes(splitTxid).reverse();
       tx.vins.push({ prevTxid: txidLE, prevVout: splitVout, scriptSig: new Uint8Array(0), sequence: 0xffffffff });
-      if (repayCcy !== "VRSC") {
+      if (!_isVrscNative(repayCcy)) {
         tx.vins.push({ prevTxid: txidLE, prevVout: feeVout, scriptSig: new Uint8Array(0), sequence: 0xffffffff });
       }
       // Add output 1: collateral-return → borrower
       const collateralCcy = status.collateral?.currency;
       const collateralAmt = parseFloat(status.collateral?.amount);
       const collateralSats = Math.round(collateralAmt * 1e8);
-      if (collateralCcy === "VRSC") {
+      if (_isVrscNative(collateralCcy)) {
         // P2PKH to borrower's R
         tx.vouts.push({ value: BigInt(collateralSats), scriptPubKey: _addrToP2pkhSpk(borrowerR) });
       } else {
-        throw new Error(`non-VRSC collateral return at repay not wired yet (${collateralCcy})`);
+        throw new Error(`non-VRSC collateral return at repay not wired yet (${displayCurrency(collateralCcy)})`);
       }
       const extendedHex = _serializeTx(tx);
 
@@ -6659,25 +6811,40 @@ async function lenderAutoFundWatcher() {
 async function validateAutoFundCandidate(req, offer) {
   const reasons = [];
 
-  // Hard caps (no oracle needed)
-  const maxAmt = parseFloat(offer.max_principal?.amount ?? 0);
+  // Principal currency: must be in the offer's lend_currencies set
+  // (legacy compat: a `max_principal.currency` is treated as a single-
+  // entry lend list).
   const reqAmt = parseFloat(req.principal?.amount ?? 0);
   if (!reqAmt || reqAmt <= 0) reasons.push("invalid principal amount");
-  if (maxAmt > 0 && reqAmt > maxAmt) reasons.push(`amount ${reqAmt} > max ${maxAmt}`);
+  let reqPrincipalId;
+  try { reqPrincipalId = await canonicalizeCurrency(req.principal?.currency); }
+  catch (e) { reasons.push(`principal currency canonicalization failed: ${e.message}`); return reasons; }
 
-  // Currency match. Compare via i-address after canonicalization to dodge
-  // FQN/string-rename impersonation (SCHEMA.md §2). If canonicalization
-  // throws (e.g. ambiguous bare name in a legacy entry), reject.
-  let reqPrincipalId, offerPrincipalId;
-  try {
-    reqPrincipalId = await canonicalizeCurrency(req.principal?.currency);
-    offerPrincipalId = await canonicalizeCurrency(offer.max_principal?.currency);
-  } catch (e) {
-    reasons.push(`principal currency canonicalization failed: ${e.message}`);
-    return reasons;
+  const lendList = Array.isArray(offer.lend_currencies) && offer.lend_currencies.length
+    ? offer.lend_currencies
+    : (offer.max_principal?.currency ? [offer.max_principal.currency] : []);
+  const lendIds = await Promise.all(
+    lendList.map((c) => canonicalizeCurrency(c).catch(() => null))
+  );
+  if (!lendIds.includes(reqPrincipalId)) {
+    reasons.push(`principal ${reqPrincipalId.slice(0,12)} not in offer's lend set`);
   }
-  if (reqPrincipalId !== offerPrincipalId) {
-    reasons.push(`principal currency ${reqPrincipalId.slice(0,12)} != offer ${offerPrincipalId.slice(0,12)}`);
+
+  // VRSC-denominated cap. New schema uses max_principal_vrsc;
+  // legacy schema (max_principal.amount in the lending currency) is
+  // converted to VRSC via oracle for the same comparison.
+  let capVrsc = parseFloat(offer.max_principal_vrsc ?? 0);
+  if (!capVrsc && offer.max_principal?.amount) {
+    capVrsc = await oracleConvertToVrsc(parseFloat(offer.max_principal.amount), offer.max_principal.currency)
+      .catch(() => null);
+  }
+  if (capVrsc > 0) {
+    const reqInVrsc = await oracleConvertToVrsc(reqAmt, reqPrincipalId).catch(() => null);
+    if (reqInVrsc === null) {
+      reasons.push(`no oracle route ${reqPrincipalId.slice(0,12)} → VRSC — can't verify cap`);
+    } else if (reqInVrsc > capVrsc + 1e-9) {
+      reasons.push(`principal ≈ ${reqInVrsc.toFixed(4)} VRSC > offer cap ${capVrsc} VRSC`);
+    }
   }
 
   // Collateral currency in accepted_collateral set (compare i-addresses).
@@ -6722,11 +6889,16 @@ async function validateAutoFundCandidate(req, offer) {
     return reasons;
   }
   const actualRatio = collAmt / principalInCollCcy;
-  const minRatio = parseFloat(offer.min_collateral_ratio ?? 0);
+  // Accept floor = stated ratio × (1 − slippage_pct/100), derived here so
+  // the lender's drift cushion never appears in the public offer payload.
+  // Default slippage 1% if the offer doesn't specify.
+  const minRatio    = parseFloat(offer.min_collateral_ratio ?? 0);
+  const slippagePct = parseFloat(offer.slippage_pct ?? 1);
+  const acceptFloor = minRatio * (1 - slippagePct / 100);
   if (actualRatio < HARD_FLOOR_RATIO) {
     reasons.push(`ratio ${actualRatio.toFixed(2)} below hard floor ${HARD_FLOOR_RATIO}`);
-  } else if (actualRatio < minRatio) {
-    reasons.push(`ratio ${actualRatio.toFixed(2)} < offer's min ${minRatio}`);
+  } else if (actualRatio < acceptFloor) {
+    reasons.push(`ratio ${actualRatio.toFixed(2)} < accept floor ${acceptFloor.toFixed(2)} (offer min ${minRatio} × (1−${slippagePct}%))`);
   }
 
   return reasons;

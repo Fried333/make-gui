@@ -13,7 +13,7 @@ This repo holds **GUI-driven** tests (Playwright + JS unit tests against modules
 
 **Protocol-level / chain-only tests** live in the spec repo at [`make-protocol/helpers/`](https://github.com/Fried333/make-protocol/tree/main/helpers) — `recover_vault.sh` (cooperative 2-of-2 vault drain) and `extend_tx.py` (raw-tx extension helper). Anything that's pure RPC with no DOM dependency belongs there.
 
-The e2e suite shells out to `helpers/recover_vault.sh` from the spec repo by default (`/home/dev/veruslending/helpers/recover_vault.sh`); override with `RECOVER_VAULT=/path/to/script` if you've moved it.
+The e2e suite shells out to `helpers/recover_vault.sh` from the spec repo by default (`/home/dev/make-protocol/helpers/recover_vault.sh`); override with `RECOVER_VAULT=/path/to/script` if you've moved it.
 
 ## Running the e2e suite
 
