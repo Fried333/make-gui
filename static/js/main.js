@@ -4290,6 +4290,17 @@ function renderOfferFormBody() {
       <label style="flex:1">Rate (decimal)<input type="number" data-f="rate" value="0.01" step="0.001" /></label>
     </div>
     <div class="row"><label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label></div>
+    <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2)">
+      <label style="display:flex;gap:8px;align-items:center;cursor:pointer">
+        <input type="checkbox" data-f="auto_fund" style="margin:0">
+        <strong>Auto-fund matching requests</strong>
+        <span class="muted" style="font-size:11px">— GUI polls every 30s and auto-posts a match when a request fits the criteria above</span>
+      </label>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        Wallet must stay unlocked. Hard floor of 1.5× ratio applies regardless of your setting.
+        Oracle pricing via local daemon's <code>estimateconversion</code>; if no on-chain route exists, that match is skipped.
+      </div>
+    </div>
     <div class="row" style="margin-top:8px;gap:8px">
       <button class="primary" data-mp-do="preview-offer" style="flex:0 0 auto">Preview</button>
       <button class="ghost"   data-mp-do="cancel" style="flex:0 0 auto">Cancel</button>
@@ -4523,6 +4534,7 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     slug = "loan.offer";
     vdxfId = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz";
     const collateralBtns = formEl.querySelectorAll(".collateral-toggle .ctog.selected");
+    const autoFund = formEl.querySelector('[data-f="auto_fund"]')?.checked || false;
     payload = {
       version: 1,
       max_principal:        { currency: f("max_principal_currency"), amount: parseFloat(f("max_principal_amount")) },
@@ -4530,6 +4542,7 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       min_collateral_ratio: parseFloat(f("min_ratio")),
       rate:                 parseFloat(f("rate")),
       term_days:            parseInt(f("term_days"), 10),
+      auto_fund:            autoFund,
       active:               true,
     };
   } else {
@@ -6416,6 +6429,164 @@ async function lenderHistoryWatcher() {
 }
 setInterval(lenderHistoryWatcher, 30000);
 setTimeout(lenderHistoryWatcher, 8000);
+
+// ── Lender auto-fund watcher (phase 1: detection only) ─────────────────
+// Symmetric to autoAcceptWatcher: walks each of the user's loan.offers
+// looking for ones with auto_fund=true, then scans for borrower
+// loan.requests that target this lender AND fit the offer's criteria
+// (currency, amount, term, collateral ratio at current oracle price).
+//
+// Phase 1 (this iteration): logs candidates only — does NOT auto-post the
+// match. Once the post-match handler is extracted into a callable function
+// (Phase 2), the candidates here flow straight into that to auto-fire.
+//
+// Hard floor: refuses to flag candidates with computed ratio < 1.5×
+// regardless of the offer's min_collateral_ratio setting, so a config
+// typo can't trigger unsecured lending.
+const HARD_FLOOR_RATIO = 1.5;
+const _autoFundInFlight = new Set();
+const _autoFundCandidates = new Map(); // request_txid → {detectedAt, offerId, reason}
+
+async function lenderAutoFundWatcher() {
+  try {
+    const myIaddrs = await inScopeIaddrs();
+    if (myIaddrs.length === 0) return;
+
+    for (const ia of myIaddrs) {
+      const info = await rpc("getidentity", [ia, -1]).catch(() => null);
+      const cm = info?.identity?.contentmultimap || {};
+      const offers = (cm[VDXF_LOAN_OFFER] || []).map((e) => {
+        const h = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+        if (!h) return null;
+        try { return JSON.parse(new TextDecoder().decode(_hexToBytes(h))); } catch { return null; }
+      }).filter((o) => o && o.auto_fund === true && o.active !== false);
+
+      if (offers.length === 0) continue;
+
+      // Pull requests targeting this lender. Free path: explorer endpoint.
+      // (Future: fall back to identity_history walk of watch-listed
+      // borrowers if explorer is unreachable.)
+      let requests = [];
+      try {
+        const url = `${EXPLORER_API}/contracts/loans/requests?target_lender_iaddr=${encodeURIComponent(ia)}&pageSize=50`;
+        const r = await fetch(url).then((x) => x.json()).catch(() => null);
+        requests = r?.results || [];
+      } catch { continue; }
+
+      for (const offer of offers) {
+        for (const req of requests) {
+          if (_autoFundInFlight.has(req.posted_tx)) continue;
+
+          const reasons = await validateAutoFundCandidate(req, offer);
+          if (reasons.length === 0) {
+            // Pass. Record candidate.
+            if (!_autoFundCandidates.has(req.posted_tx)) {
+              _autoFundCandidates.set(req.posted_tx, {
+                detectedAt: Date.now(),
+                offerActingIaddr: ia,
+                requestIaddr: req.iaddr,
+                principal: req.principal,
+                collateral: req.collateral,
+              });
+              console.log(`[auto-fund] candidate request ${req.posted_tx?.slice(0,16)} from ${req.iaddr?.slice(0,12)} matches offer on ${ia.slice(0,12)} — Phase 2 will auto-post the match`);
+            }
+            // Phase 2: trigger the post-match flow here.
+            // Phase 1: just record.
+          } else {
+            // Log only the FIRST rejection per request to avoid log spam.
+            if (!_autoFundCandidates.has(`reject:${req.posted_tx}`)) {
+              _autoFundCandidates.set(`reject:${req.posted_tx}`, { reasons });
+              console.log(`[auto-fund] skipping ${req.posted_tx?.slice(0,16)} from ${req.iaddr?.slice(0,12)}: ${reasons.join(", ")}`);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[auto-fund] watcher error:", e?.message);
+  }
+}
+
+// Returns array of rejection reasons (empty = pass). Each check is its
+// own line so the diagnostic log can show which constraint failed.
+async function validateAutoFundCandidate(req, offer) {
+  const reasons = [];
+
+  // Hard caps (no oracle needed)
+  const maxAmt = parseFloat(offer.max_principal?.amount ?? 0);
+  const reqAmt = parseFloat(req.principal?.amount ?? 0);
+  if (!reqAmt || reqAmt <= 0) reasons.push("invalid principal amount");
+  if (maxAmt > 0 && reqAmt > maxAmt) reasons.push(`amount ${reqAmt} > max ${maxAmt}`);
+
+  // Currency match. Compare via i-address after canonicalization to dodge
+  // FQN/string-rename impersonation (SCHEMA.md §2). If canonicalization
+  // throws (e.g. ambiguous bare name in a legacy entry), reject.
+  let reqPrincipalId, offerPrincipalId;
+  try {
+    reqPrincipalId = await canonicalizeCurrency(req.principal?.currency);
+    offerPrincipalId = await canonicalizeCurrency(offer.max_principal?.currency);
+  } catch (e) {
+    reasons.push(`principal currency canonicalization failed: ${e.message}`);
+    return reasons;
+  }
+  if (reqPrincipalId !== offerPrincipalId) {
+    reasons.push(`principal currency ${reqPrincipalId.slice(0,12)} != offer ${offerPrincipalId.slice(0,12)}`);
+  }
+
+  // Collateral currency in accepted_collateral set (compare i-addresses).
+  let reqCollId;
+  try { reqCollId = await canonicalizeCurrency(req.collateral?.currency); }
+  catch (e) { reasons.push(`collateral currency: ${e.message}`); return reasons; }
+  const acceptedIds = await Promise.all(
+    (offer.accepted_collateral || []).map((c) => canonicalizeCurrency(c).catch(() => null))
+  );
+  if (!acceptedIds.includes(reqCollId)) {
+    reasons.push(`collateral ${reqCollId.slice(0,12)} not in offer's accepted set`);
+  }
+
+  // Term cap
+  if (offer.term_days && req.term_days > offer.term_days) {
+    reasons.push(`term ${req.term_days}d > offer's ${offer.term_days}d`);
+  }
+
+  // Collateral ratio (oracle-checked). Same multi-route fallback as the
+  // borrower's request-form suggestion.
+  const collAmt = parseFloat(req.collateral?.amount ?? 0);
+  if (!collAmt || collAmt <= 0) { reasons.push("invalid collateral amount"); return reasons; }
+  let principalInCollCcy = null;
+  if (reqPrincipalId === reqCollId) {
+    principalInCollCcy = reqAmt;  // 1:1
+  } else {
+    const VIAS = [null, "Bridge.vETH", "Bridge.vARRR", "Bridge.vDEX", "Pure"];
+    for (const via of VIAS) {
+      try {
+        const params = { currency: reqPrincipalId, amount: reqAmt, convertto: reqCollId };
+        if (via) params.via = via;
+        const q = await rpc("estimateconversion", [params]);
+        if (q?.estimatedcurrencyout && parseFloat(q.estimatedcurrencyout) > 0) {
+          principalInCollCcy = parseFloat(q.estimatedcurrencyout);
+          break;
+        }
+      } catch {}
+    }
+  }
+  if (principalInCollCcy === null) {
+    reasons.push(`no oracle route ${reqPrincipalId.slice(0,12)} → ${reqCollId.slice(0,12)} — can't verify ratio`);
+    return reasons;
+  }
+  const actualRatio = collAmt / principalInCollCcy;
+  const minRatio = parseFloat(offer.min_collateral_ratio ?? 0);
+  if (actualRatio < HARD_FLOOR_RATIO) {
+    reasons.push(`ratio ${actualRatio.toFixed(2)} below hard floor ${HARD_FLOOR_RATIO}`);
+  } else if (actualRatio < minRatio) {
+    reasons.push(`ratio ${actualRatio.toFixed(2)} < offer's min ${minRatio}`);
+  }
+
+  return reasons;
+}
+
+setInterval(lenderAutoFundWatcher, 30000);
+setTimeout(lenderAutoFundWatcher, 12000);
 
 // ── Decline notifications watcher (borrower side) ─────────────────────
 // Polls each lender that the borrower has an open request directed at,
