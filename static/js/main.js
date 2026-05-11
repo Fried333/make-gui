@@ -6559,7 +6559,7 @@ async function lenderAutoFundWatcher() {
 
           const reasons = await validateAutoFundCandidate(req, offer);
           if (reasons.length === 0) {
-            // Pass. Record candidate.
+            // Pass. Record candidate + (Phase 2) auto-fire if opt-in.
             if (!_autoFundCandidates.has(req.posted_tx)) {
               _autoFundCandidates.set(req.posted_tx, {
                 detectedAt: Date.now(),
@@ -6568,10 +6568,20 @@ async function lenderAutoFundWatcher() {
                 principal: req.principal,
                 collateral: req.collateral,
               });
-              console.log(`[auto-fund] candidate request ${req.posted_tx?.slice(0,16)} from ${req.iaddr?.slice(0,12)} matches offer on ${ia.slice(0,12)} — Phase 2 will auto-post the match`);
+              console.log(`[auto-fund] candidate request ${req.posted_tx?.slice(0,16)} from ${req.iaddr?.slice(0,12)} matches offer on ${ia.slice(0,12)}`);
             }
-            // Phase 2: trigger the post-match flow here.
-            // Phase 1: just record.
+            // Phase 2: fire the post-match flow via synthetic clicks
+            // against the existing battle-tested handlers. Opt-in via
+            // localStorage.vl_auto_fund_enabled = "1" so it doesn't
+            // surprise users on first run.
+            if (localStorage.getItem("vl_auto_fund_enabled") === "1"
+                && !_autoFundInFlight.has(req.posted_tx)) {
+              _autoFundInFlight.add(req.posted_tx);
+              fireAutoFundCandidate(req, offer, ia).catch((e) => {
+                console.warn(`[auto-fund] fire failed for ${req.posted_tx?.slice(0,12)}: ${e?.message}`);
+                _autoFundInFlight.delete(req.posted_tx);
+              });
+            }
           } else {
             // Log only the FIRST rejection per request to avoid log spam.
             if (!_autoFundCandidates.has(`reject:${req.posted_tx}`)) {
@@ -6667,6 +6677,77 @@ async function validateAutoFundCandidate(req, offer) {
 
 setInterval(lenderAutoFundWatcher, 30000);
 setTimeout(lenderAutoFundWatcher, 12000);
+
+// Phase 2: actually post the match for a candidate that passed validation.
+// Strategy: drive the existing post-match flow via synthetic clicks against
+// the marketplace row, reusing the battle-tested handlers (scenario 1
+// covers them comprehensively). Requirements:
+//   - Marketplace tab must be active (the row must be in DOM)
+//   - Wallet must be unlocked
+// Bail-outs (graceful, no funds at risk):
+//   - Tab inactive → log + skip (don't steal focus)
+//   - Row not found → log + skip
+//   - Confirm button never enables in 30s → abort
+//   - Re-validation at broadcast time fails (price drifted) → dismiss panel
+async function fireAutoFundCandidate(req, offer, actingIaddr) {
+  const reqTxid = req.posted_tx;
+  try {
+    // Need marketplace tab active so the row renders in DOM.
+    const mpTab = document.querySelector('[data-mp-tab="market"]');
+    if (!mpTab?.classList.contains("active")) {
+      console.log(`[auto-fund] marketplace tab not active — skipping ${reqTxid?.slice(0,12)} (open Marketplace to enable auto-fund)`);
+      return;
+    }
+    // Bust the 15s market cache so loadMarket fetches fresh and the row
+    // renders, then wait one tick.
+    invalidateMarketCache();
+    await loadMarket();
+    await new Promise((r) => setTimeout(r, 500));
+
+    const requestKey = `req-${req.iaddr}-${reqTxid}`;
+    const row = document.querySelector(`.mp-row[data-request-key="${CSS.escape(requestKey)}"]`);
+    if (!row) {
+      console.warn(`[auto-fund] row not in DOM for ${reqTxid?.slice(0,12)} after loadMarket — skipping`);
+      return;
+    }
+    const fundBtn = row.querySelector('[data-mp-row-act="post-match"]');
+    if (!fundBtn) return;
+    fundBtn.click();
+
+    // Wait up to 30s for the confirm button to enable (balanceReady +
+    // dataset.acting + dataset.vaultAddress all set by the existing
+    // post-match panel handler).
+    const panel = row.querySelector(".post-match-panel");
+    let confirmReady = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const goBtn = panel?.querySelector('[data-mp-row-act="post-match-go"]');
+      if (goBtn && !goBtn.disabled) { confirmReady = true; break; }
+    }
+    if (!confirmReady) {
+      console.warn(`[auto-fund] confirm button never enabled for ${reqTxid?.slice(0,12)} (30s timeout)`);
+      return;
+    }
+
+    // Re-validate against the OFFER + CURRENT oracle price right before
+    // broadcasting. Price may have moved between detection and now (could
+    // be 30s+ depending on panel-setup time). If it slipped below the
+    // floor, dismiss the panel rather than fund a stale price.
+    const recheckReasons = await validateAutoFundCandidate(req, offer);
+    if (recheckReasons.length > 0) {
+      console.warn(`[auto-fund] re-check failed at broadcast for ${reqTxid?.slice(0,12)}: ${recheckReasons.join(", ")} — dismissing panel`);
+      panel.querySelector('[data-mp-row-act="post-match-cancel"]')?.click();
+      return;
+    }
+
+    console.log(`[auto-fund] firing confirm for ${reqTxid?.slice(0,12)} from offer on ${actingIaddr.slice(0,12)}`);
+    panel.querySelector('[data-mp-row-act="post-match-go"]')?.click();
+  } finally {
+    // Stay in _autoFundInFlight so we don't retry even after success/abort.
+    // A loadMarket cycle will see the new loan.match and the row's "Fund
+    // this loan" button will be replaced — no risk of re-firing.
+  }
+}
 
 // ── Decline notifications watcher (borrower side) ─────────────────────
 // Polls each lender that the borrower has an open request directed at,
