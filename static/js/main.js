@@ -3415,6 +3415,29 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       const bSigned = await rpc("signrawtransaction", [r.tx_b_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
       if (!bSigned.complete) throw new Error("Tx-B did not complete: " + JSON.stringify(bSigned.errors || {}));
 
+      // Pre-flight: confirm every non-borrower input on Tx-A is still
+      // unspent. The pre-signed Tx-A only commits to chain on sendraw, but
+      // a stale match (lender's UTXO already consumed elsewhere) wastes a
+      // signing round-trip and produces an opaque mempool error. Identify
+      // the borrower's own inputs from their pre-signed request skeleton
+      // and gettxout-check everything else.
+      btn.textContent = "Checking lender's principal input is still unspent…";
+      const borrowerInputs = new Set();
+      if (r.borrower_input_signed_hex) {
+        try {
+          const bDecoded = await rpc("decoderawtransaction", [r.borrower_input_signed_hex]);
+          for (const bv of (bDecoded.vin || [])) borrowerInputs.add(`${bv.txid}:${bv.vout}`);
+        } catch {}
+      }
+      for (const v of (decodedA.vin || [])) {
+        if (!v.txid) continue;
+        if (borrowerInputs.has(`${v.txid}:${v.vout}`)) continue;
+        const out = await rpc("gettxout", [v.txid, v.vout, true]).catch(() => null);
+        if (!out) {
+          throw new Error(`Lender's input ${v.txid.slice(0,16)}:${v.vout} has already been spent — this match is stale. Decline it and ask the lender to repost.`);
+        }
+      }
+
       // Broadcast Tx-A.
       btn.textContent = "Broadcasting Tx-A…";
       const txABroadcastTxid = await rpc("sendrawtransaction", [r.tx_a_full]);

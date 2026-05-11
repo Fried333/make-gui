@@ -107,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
     # encryptwallet, ...) is rejected at the proxy.
     ALLOWED_RPC = {
         "getinfo", "getblockcount", "getbestblockhash", "getblockheader",
-        "getrawmempool", "getrawtransaction", "decoderawtransaction",
+        "getrawmempool", "getrawtransaction", "decoderawtransaction", "gettxout",
         "createrawtransaction", "signrawtransaction", "sendrawtransaction",
         "getaddressbalance", "getaddressutxos", "getaddressmempool",
         "getaddresstxids",
