@@ -93,13 +93,21 @@ async function canonicalizeCurrency(input) {
 function displayCurrency(iaddr) {
   if (!iaddr) return "?";
   if (!_IADDR_RE.test(iaddr)) return iaddr;  // already a name; pass through
+  // Well-known table first (synchronous + no daemon call needed).
+  const known = _ccyFqn(iaddr);
+  if (known) return known;
   if (_ccyDisplayCache.has(iaddr)) return _ccyDisplayCache.get(iaddr);
-  return iaddr.slice(0, 12) + "…";  // short i-address fallback
+  // Kick off async resolution so the next render gets the real name.
+  // Fire-and-forget; this call returns immediately with the i-address.
+  displayCurrencyAsync(iaddr).catch(() => {});
+  return iaddr.slice(0, 12) + "…";  // short i-address fallback for now
 }
 
 async function displayCurrencyAsync(iaddr) {
   if (!iaddr) return "?";
   if (!_IADDR_RE.test(iaddr)) return iaddr;
+  const known = _ccyFqn(iaddr);
+  if (known) return known;
   if (_ccyDisplayCache.has(iaddr)) return _ccyDisplayCache.get(iaddr);
   const c = await rpc("getcurrency", [iaddr]).catch(() => null);
   const name = c?.fullyqualifiedname || c?.name || iaddr.slice(0, 12) + "…";
@@ -524,10 +532,14 @@ function escapeHtml(s) {
 
 function formatAmount(a) {
   if (!a || typeof a !== "object") return "—";
-  // Chain-controlled (anyone with a VerusID can post arbitrary multimap
-  // entries), so always escape before returning — safe to inline into
-  // innerHTML at call sites.
-  return `${escapeHtml(a.amount ?? "?")} ${escapeHtml(a.currency ?? "")}`;
+  // Currency on the wire is an i-address (SCHEMA §2). Display it as a FQN
+  // when we know it (well-known currencies cached in CURRENCIES, or
+  // resolved earlier via displayCurrencyAsync). Fall back to the raw
+  // i-address (or whatever string we got) if unknown.
+  // Chain-controlled values — always escape on the way to innerHTML.
+  const rawCcy = a.currency ?? "";
+  const ccyDisplay = displayCurrency(rawCcy);
+  return `${escapeHtml(a.amount ?? "?")} ${escapeHtml(ccyDisplay)}`;
 }
 
 // ---------- header status ----------
@@ -2456,7 +2468,7 @@ function renderMarketOffer(r, mySet, myMap, acting) {
       </div>
       <div class="kv">
         <div><span class="k">max</span><span class="v">${formatAmount(r.max_principal)}</span></div>
-        <div><span class="k">accepts</span><span class="v">${(r.accepted_collateral || []).join(", ") || "—"}</span></div>
+        <div><span class="k">accepts</span><span class="v">${escapeHtml((r.accepted_collateral || []).map(displayCurrency).join(", ") || "—")}</span></div>
         <div><span class="k">min ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}×</span></div>
         <div><span class="k">rate</span><span class="v">${r.rate != null ? (r.rate * 100).toFixed(1) + "%" : "?"}</span></div>
         <div><span class="k">term</span><span class="v">${escapeHtml(r.term_days ?? "?")} days</span></div>
