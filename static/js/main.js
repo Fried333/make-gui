@@ -6574,12 +6574,16 @@ async function lenderAutoFundWatcher() {
             // against the existing battle-tested handlers. Opt-in via
             // localStorage.vl_auto_fund_enabled = "1" so it doesn't
             // surprise users on first run.
+            //
+            // The function itself manages _autoFundInFlight — it only
+            // marks the request as "in-flight" once a broadcast actually
+            // starts. Silent early returns (tab not active, row not in
+            // DOM, re-quote failed) leave the request available for the
+            // next 30s watcher cycle to retry.
             if (localStorage.getItem("vl_auto_fund_enabled") === "1"
                 && !_autoFundInFlight.has(req.posted_tx)) {
-              _autoFundInFlight.add(req.posted_tx);
               fireAutoFundCandidate(req, offer, ia).catch((e) => {
                 console.warn(`[auto-fund] fire failed for ${req.posted_tx?.slice(0,12)}: ${e?.message}`);
-                _autoFundInFlight.delete(req.posted_tx);
               });
             }
           } else {
@@ -6692,26 +6696,50 @@ setTimeout(lenderAutoFundWatcher, 12000);
 async function fireAutoFundCandidate(req, offer, actingIaddr) {
   const reqTxid = req.posted_tx;
   try {
-    // Need marketplace tab active so the row renders in DOM.
-    const mpTab = document.querySelector('[data-mp-tab="market"]');
-    if (!mpTab?.classList.contains("active")) {
-      console.log(`[auto-fund] marketplace tab not active — skipping ${reqTxid?.slice(0,12)} (open Marketplace to enable auto-fund)`);
+    // Requests directed at us as lender render under the "loans" sub-tab
+    // (the "Awaiting your action" section), NOT the "market" sub-tab —
+    // "market" shows others' OFFERS only. Accept either tab; the row
+    // existence check below is what really matters.
+    const activeTabBtn = document.querySelector("#market [data-mp-tab].active");
+    const activeTab = activeTabBtn?.dataset.mpTab;
+    if (activeTab !== "loans" && activeTab !== "market") {
+      console.log(`[auto-fund] sub-tab "${activeTab}" doesn't show pending requests — skipping ${reqTxid?.slice(0,12)} (switch to Loans or Marketplace to enable auto-fund)`);
       return;
     }
     // Bust the 15s market cache so loadMarket fetches fresh and the row
-    // renders, then wait one tick.
+    // renders, then wait for the cycle to complete (loadMarket is async
+    // and uses a "newer load wins" token — a tail-side rapid loadMarket()
+    // call can be silently aborted, so wait a longer cushion).
     invalidateMarketCache();
     await loadMarket();
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 2000));
 
     const requestKey = `req-${req.iaddr}-${reqTxid}`;
-    const row = document.querySelector(`.mp-row[data-request-key="${CSS.escape(requestKey)}"]`);
+    let row = document.querySelector(`.mp-row[data-request-key="${CSS.escape(requestKey)}"]`);
     if (!row) {
-      console.warn(`[auto-fund] row not in DOM for ${reqTxid?.slice(0,12)} after loadMarket — skipping`);
-      return;
+      console.log(`[auto-fund] row not in DOM yet for ${reqTxid?.slice(0,12)} — retrying once after 3s`);
+      await new Promise((r) => setTimeout(r, 3000));
+      invalidateMarketCache();
+      await loadMarket();
+      await new Promise((r) => setTimeout(r, 2000));
+      row = document.querySelector(`.mp-row[data-request-key="${CSS.escape(requestKey)}"]`);
+      if (!row) {
+        // Diag: what rows ARE in DOM, what mp-tab is active, are any
+        // panels op-active (loadMarket guards on that).
+        const allRows = Array.from(document.querySelectorAll(".mp-row[data-request-key]")).map((r) => r.dataset.requestKey);
+        const activeOpRows = Array.from(document.querySelectorAll(".post-match-panel[data-op-active=\"1\"], .accept-panel[data-op-active=\"1\"]")).length;
+        const mpTabActive = document.querySelector("[data-mp-tab].active")?.dataset.mpTab || "?";
+        console.warn(`[auto-fund] row still not in DOM for ${reqTxid?.slice(0,12)} — leaving for next cycle. ` +
+          `mp-tab=${mpTabActive} active-ops=${activeOpRows} rows-in-dom=[${allRows.slice(0, 5).join(", ")}${allRows.length > 5 ? `, +${allRows.length-5} more` : ""}]`);
+        return;
+      }
     }
     const fundBtn = row.querySelector('[data-mp-row-act="post-match"]');
     if (!fundBtn) return;
+    // We're committing to fund this candidate now. Mark in-flight so the
+    // watcher doesn't fire again on the next 30s cycle before the post
+    // completes.
+    _autoFundInFlight.add(reqTxid);
     fundBtn.click();
 
     // Wait up to 30s for the confirm button to enable (balanceReady +
