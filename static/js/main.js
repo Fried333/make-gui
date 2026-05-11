@@ -2820,6 +2820,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         }
         return Object.entries(cv).some(([k, v]) => k && parseFloat(v) >= principalAmt);
       });
+      // Mark balance check as complete on the panel itself (survives the
+      // innerHTML replacement below). The confirm-button enable gate further
+      // down checks this alongside dataset.acting / vaultAddress — clicking
+      // before *every* async dependency resolved is the #100/#104 race
+      // pattern. Codifying each precondition explicitly so future additions
+      // (e.g. pubkey, vault, balance) just add another flag here.
+      panel.dataset.balanceReady = candidates.length > 0 ? "1" : "0";
       panel.innerHTML = `
         <div class="review">
           <strong>Post a pre-signed match for ${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
@@ -2867,13 +2874,18 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         panel.dataset.actingFqn = lenderInfo?.identity?.fullyqualifiedname || acting;
         panel.dataset.actingParent = lenderInfo?.identity?.parent || "";
         panel.dataset.actingName = lenderInfo?.identity?.name || "";
-        // Dataset is fully populated — enable the Confirm button. Until now
-        // it was disabled because clicking with an empty dataset would fire
-        // the handler with `acting=undefined` and surface as "request directed
-        // at <X>, you are acting as undefined". This race is the root cause
-        // of that error; gating the button on dataset readiness eliminates it.
+        // All async preconditions resolved — enable the Confirm button.
+        // Requires: balance check done (dataset.balanceReady), vault P2SH
+        // derived + dataset fully populated (dataset.acting + vaultAddress).
+        // Clicking with any of these missing fires the handler with partial
+        // state and surfaces as a confusing "acting=undefined" or wallet
+        // error (the #100/#104 race pattern). Each new precondition should
+        // add its own flag check here.
         const goBtn = panel.querySelector('[data-mp-row-act="post-match-go"]');
-        if (goBtn) { goBtn.disabled = false; goBtn.removeAttribute('title'); }
+        const ready = panel.dataset.balanceReady === "1"
+                   && !!panel.dataset.acting
+                   && !!panel.dataset.vaultAddress;
+        if (goBtn && ready) { goBtn.disabled = false; goBtn.removeAttribute('title'); }
       } catch (e) {
         const vp = panel.querySelector(".vault-preview");
         if (vp) vp.textContent = `(could not derive vault: ${e.message})`;
