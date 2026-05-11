@@ -4045,8 +4045,18 @@ function runFormValidation(formEl) {
       : `<span style="color:var(--bad)">✗ collateral ratio ${ratio.toFixed(2)}× &lt; lender's required ${minRatio.toFixed(2)}×</span>`
     );
   }
-  out.innerHTML = messages.join("<br>")
-    + `<div class="collateral-suggestion muted" style="margin-top:4px;font-size:12px"></div>`;
+  out.innerHTML = messages.join("<br>");
+  // Suggestion div is a SIBLING of .form-validation, not a child. Putting
+  // it inside out.innerHTML caused a race: applySuggestedCollateral fires
+  // an input event → runFormValidation re-runs → rewrites out.innerHTML →
+  // replaces the suggestion's content before it can be read.
+  let sugEl = out.parentElement?.querySelector(":scope > .collateral-suggestion");
+  if (!sugEl && out.parentElement) {
+    sugEl = document.createElement("div");
+    sugEl.className = "collateral-suggestion muted";
+    sugEl.style.cssText = "margin-top:4px;font-size:12px";
+    out.parentElement.appendChild(sugEl);
+  }
 
   // Color the R-balance line based on the collateral check.
   if (balLine) balLine.style.color = collOk ? "var(--ok)" : "var(--bad)";
@@ -4088,8 +4098,8 @@ async function doUpdateCollateralSuggestion(formEl) {
   // Same-currency: 1:1, just multiply by ratio.
   if (principalCcy === collCcy) {
     const suggested = principalAmt * minRatio;
-    sugEl.innerHTML = `Suggested collateral for ${minRatio}× coverage: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code> `
-      + `<button class="ghost" type="button" data-act="apply-suggested" data-val="${suggested}" style="font-size:11px;padding:2px 8px;margin-left:6px">Use this</button>`;
+    applySuggestedCollateral(formEl, suggested);
+    sugEl.innerHTML = `Auto-set collateral for ${minRatio}× coverage: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code>`;
     return;
   }
 
@@ -4128,10 +4138,29 @@ async function doUpdateCollateralSuggestion(formEl) {
   }
   const principalInCollCcy = parseFloat(quote.estimatedcurrencyout);
   const suggested = principalInCollCcy * minRatio;
+  applySuggestedCollateral(formEl, suggested);
   const viaLabel = viaUsed ? ` <span class="muted" style="font-size:11px">via ${escapeHtml(viaUsed)}</span>` : "";
   sugEl.innerHTML = `At current rate, ${principalAmt} ${escapeHtml(principalCcy)} ≈ ${principalInCollCcy.toFixed(4)} ${escapeHtml(collCcy)}${viaLabel}. `
-    + `Suggested ${minRatio}× collateral: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code> `
-    + `<button class="ghost" type="button" data-act="apply-suggested" data-val="${suggested.toFixed(4)}" style="font-size:11px;padding:2px 8px;margin-left:6px">Use this</button>`;
+    + `Auto-set ${minRatio}× collateral: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code>`;
+}
+
+// Populate the collateral_amount field with the oracle-derived value and
+// re-run validation so the row updates. Always overwrites on the first
+// auto-set (form's default value isn't real user input). On subsequent
+// auto-fires, only overwrites if the current value matches our previous
+// auto-value — meaning the user hasn't manually edited since we set it.
+function applySuggestedCollateral(formEl, suggested) {
+  const input = formEl.querySelector('[data-f="collateral_amount"]');
+  if (!input) return;
+  const formatted = suggested.toFixed(4);
+  const lastAuto = input.dataset.lastAutoVal;
+  // First run: lastAuto undefined → overwrite (form's default isn't user input)
+  // Subsequent: only overwrite if current value matches our last auto-set
+  // (user hasn't typed something different in the meantime).
+  if (lastAuto !== undefined && input.value !== lastAuto) return;
+  input.value = formatted;
+  input.dataset.lastAutoVal = formatted;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 // Click handler for "Use this" inside the suggestion. Sets the
