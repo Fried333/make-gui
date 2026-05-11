@@ -19,6 +19,18 @@ Anyone can fork, extend, or replace it — the chain is the source of truth.
   pre-signed against a fresh single-currency UTXO; lender posts a `loan.match`
   containing all three pre-signed partials (Tx-A, Tx-Repay, Tx-B); borrower
   clicks Accept to broadcast Tx-A and open the loan
+- **Oracle-driven collateral suggestion** — when the borrower picks a
+  principal currency + amount + collateral currency, the request form
+  fetches a live price via the local daemon's `estimateconversion`
+  (multi-route fallback: direct → Bridge.vETH → Bridge.vARRR → Pure) and
+  auto-populates the suggested collateral at the lender's target ratio.
+  User can override; suggestion stays live as inputs change
+- **Lender auto-fund (opt-in)** — lender's offer can carry `auto_fund:
+  true` and the GUI runs a 30s watcher that auto-posts the match when a
+  request matches the offer's criteria (currency, amount cap, term cap,
+  oracle-priced collateral ratio with a 1.5× hard floor). Wallet stays
+  unlocked, GUI signs locally — never holds keys server-side. Enable
+  via `localStorage.vl_auto_fund_enabled = "1"`
 - **Active loans tab** — lists open loans on local identities, with a
   Repay button that auto-splits a clean repayment UTXO, extends Tx-Repay,
   broadcasts, and posts `loan.history` for credit-score reputation
@@ -100,8 +112,10 @@ VDXF ids are deterministic — re-derive any of them with
 
 Full lifecycle (request → match → accept → repay, plus 8 edge cases —
 cancels, manual accept, lost localStorage, insufficient funds, chain-only
-recovery, replay safety) validated via Playwright driving two browser
-instances against two local daemons on Verus mainnet. See
+recovery, replay safety) plus the new **lender auto-fund** pipeline
+(scenario 14: offer + matching request → match auto-posted → loan
+settled, no manual lender click) validated via Playwright driving two
+browser instances against two local daemons on Verus mainnet. See
 `test_e2e_v3_all.mjs` for the test driver.
 
 ## What's NOT yet wired
