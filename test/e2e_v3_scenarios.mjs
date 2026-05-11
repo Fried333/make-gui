@@ -306,7 +306,23 @@ async function postRequestViaGui(page, params) {
   }, { timeout: 30000 });
   await page.evaluate((p) => {
     const f = document.getElementById("mp-post-form");
-    const setVal = (sel, v) => { const el = f.querySelector(sel); if (el) { el.value = v; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); } };
+    const setVal = (sel, v) => {
+      const el = f.querySelector(sel);
+      if (!el) return;
+      // For <select>: dropdown values are now i-addresses (SCHEMA.md §2 —
+      // wire format is i-address, label is FQN). If the caller passed a
+      // FQN, look up the option whose label matches and use its value.
+      if (el.tagName === "SELECT") {
+        const direct = Array.from(el.options).find((o) => o.value === v);
+        const byLabel = Array.from(el.options).find((o) => o.textContent === v);
+        const opt = direct || byLabel;
+        if (opt) el.value = opt.value;
+      } else {
+        el.value = v;
+      }
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
     setVal('[data-f="target_lender"]', p.lender);
     setVal('[data-f="principal_amount"]', String(p.principal));
     setVal('[data-f="principal_currency"]', p.principalCcy);

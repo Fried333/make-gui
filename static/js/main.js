@@ -16,24 +16,37 @@ import { rpc, ping } from "./rpc.js";
 
 const EXPLORER_API = "https://scan.verus.cx/api";
 
-// Common Verus currencies (full canonical names). Used for dropdowns + toggles.
+// Common Verus currencies. SCHEMA.md §2: wire format is the i-address;
+// the FQN is display sugar only. Dropdown <option> values + collateral
+// toggle data-cur attributes are i-addresses; labels/text are FQNs.
 const CURRENCIES = [
-  "VRSC",
-  "DAI.vETH",
-  "vETH",
-  "MKR.vETH",
-  "vUSDC.vETH",
-  "vUSDT.vETH",
-  "LINK.vETH",
-  "tBTC.vETH",
-  "EURC.vETH",
-  "vARRR",
-  "vDEX",
-  "CHIPS",
+  { iaddr: "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV", fqn: "VRSC" },
+  { iaddr: "iGBs4DWztRNvNEJBt4mqHszLxfKTNHTkhM", fqn: "DAI.vETH" },
+  { iaddr: "i9nwxtKuVYX4MSbeULLiK2ttVi6rUEhh4X", fqn: "vETH" },
+  { iaddr: "iCkKJuJScy4Z6NSDK7Mt42ZAB2NEnAE1o4", fqn: "MKR.vETH" },
+  { iaddr: "i61cV2uicKSi1rSMQCBNQeSYC3UAi9GVzd", fqn: "vUSDC.vETH" },
+  { iaddr: "i9oCSqKALwJtcv49xUKS2U2i79h1kX6NEY", fqn: "vUSDT.vETH" },
+  { iaddr: "iS8TfRPfVpKo5FVfSUzfHBQxo9KuzpnqLU", fqn: "tBTC.vETH" },
+  { iaddr: "iC5TQFrFXSYLQGkiZ8FYmZHFJzaRF5CYgE", fqn: "EURC.vETH" },
+  { iaddr: "iExBJfZYK7KREDpuhj6PzZBzqMAKaFg7d2", fqn: "vARRR" },
+  { iaddr: "iHog9UCTrn95qpUBFCZ7kKz7qWdMA8MQ6N", fqn: "vDEX" },
+  { iaddr: "iJ3WZocnjG9ufv7GKUA4LijQno5gTMb7tP", fqn: "CHIPS" },
 ];
 
+// Accept either an i-address or a FQN as `selected` so callers can stay
+// human-readable. The option value emitted is always the i-address.
 function currencyOptions(selected = "VRSC") {
-  return CURRENCIES.map((c) => `<option value="${c}"${c === selected ? " selected" : ""}>${c}</option>`).join("");
+  const selIaddr = (CURRENCIES.find((c) => c.fqn === selected || c.iaddr === selected) || CURRENCIES[0]).iaddr;
+  return CURRENCIES.map((c) =>
+    `<option value="${c.iaddr}"${c.iaddr === selIaddr ? " selected" : ""}>${c.fqn}</option>`
+  ).join("");
+}
+
+// Resolve i-address → FQN from the static table. Falls back to the
+// dynamic displayCurrency cache below for currencies not in CURRENCIES.
+function _ccyFqn(iaddr) {
+  const c = CURRENCIES.find((x) => x.iaddr === iaddr);
+  return c?.fqn || null;
 }
 
 // ── Currency canonicalization (SCHEMA.md §2 currency rule) ───────────
@@ -754,7 +767,7 @@ function renderOfferForm() {
         <label>Accepted collateral (click to toggle)</label>
         <div class="collateral-toggle" data-f="accepted_collateral">
           ${CURRENCIES.map((c) => `
-            <button type="button" class="ctog ${c === "VRSC" || c === "DAI.vETH" ? "selected" : ""}" data-cur="${c}">${c}</button>
+            <button type="button" class="ctog ${c.fqn === "VRSC" || c.fqn === "DAI.vETH" ? "selected" : ""}" data-cur="${c.iaddr}">${c.fqn}</button>
           `).join("")}
         </div>
       </div>
@@ -3923,7 +3936,19 @@ async function openMarketPostForm(kind, prefill) {
   if (prefill) {
     const setVal = (selector, val) => {
       const el = formEl.querySelector(selector);
-      if (el && val != null && val !== "") el.value = String(val);
+      if (!el || val == null || val === "") return;
+      // For <select>: option values are i-addresses, labels are FQNs.
+      // If the prefill carried a FQN (e.g. from a legacy offer), look
+      // up the matching option by label.
+      if (el.tagName === "SELECT") {
+        const v = String(val);
+        const direct  = Array.from(el.options).find((o) => o.value === v);
+        const byLabel = Array.from(el.options).find((o) => o.textContent.trim() === v);
+        const opt = direct || byLabel;
+        if (opt) el.value = opt.value;
+      } else {
+        el.value = String(val);
+      }
     };
     setVal('[data-f="target_lender"]',       prefill.target_lender);
     setVal('[data-f="principal_amount"]',    prefill.principal_amount);
@@ -3936,24 +3961,18 @@ async function openMarketPostForm(kind, prefill) {
       formEl.dataset.minCollateralRatio = String(prefill.min_collateral_ratio);
     }
     // Restrict the collateral_currency dropdown to currencies the lender's
-    // offer actually accepts. Without this filter, the borrower can pick a
-    // currency the lender won't fund and waste a multimap entry posting a
-    // request that auto-fund will skip on the currency check.
-    // accepted_collateral may carry FQN strings (legacy) or i-addresses
-    // (current spec); match both formats so legacy offers still filter.
+    // offer actually accepts. Match BOTH i-address (current SCHEMA §2)
+    // AND FQN (legacy entries) so old + new offers both filter correctly.
+    // Option values are now i-addresses; option text is FQN.
     if (Array.isArray(prefill.accepted_collateral) && prefill.accepted_collateral.length > 0) {
       const allowed = new Set(prefill.accepted_collateral);
       const sel = formEl.querySelector('[data-f="collateral_currency"]');
       if (sel) {
         for (const opt of Array.from(sel.options)) {
-          // Keep option if its FQN value is in allowed, OR if its i-address
-          // resolution is in allowed. We don't pre-resolve here; the
-          // checks happen at post time via canonicalizeCurrency.
-          if (!allowed.has(opt.value)) opt.remove();
+          // Keep option if its i-address value OR its FQN label is in the
+          // allowed set. Covers both wire formats.
+          if (!allowed.has(opt.value) && !allowed.has(opt.textContent.trim())) opt.remove();
         }
-        // If we filtered everything out, restore the first option so the
-        // user isn't stuck with an empty dropdown (rare; means the offer's
-        // accepted_collateral has unknown FQN strings).
         if (sel.options.length === 0) {
           sel.innerHTML = currencyOptions("VRSC");
         }
@@ -4351,7 +4370,7 @@ function renderOfferFormBody() {
     <div>
       <label>Accepted collateral (click to toggle)</label>
       <div class="collateral-toggle" data-f="accepted_collateral">
-        ${CURRENCIES.map((c) => `<button type="button" class="ctog ${c === "VRSC" || c === "DAI.vETH" ? "selected" : ""}" data-cur="${c}">${c}</button>`).join("")}
+        ${CURRENCIES.map((c) => `<button type="button" class="ctog ${c.fqn === "VRSC" || c.fqn === "DAI.vETH" ? "selected" : ""}" data-cur="${c.iaddr}">${c.fqn}</button>`).join("")}
       </div>
     </div>
     <div class="row" style="margin-top:8px">
