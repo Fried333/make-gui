@@ -4906,6 +4906,21 @@ async function enrichActiveLoanBalances() {
         if (!matchPayload?.tx_repay_partial || !matchPayload?.vault_redeem_script) {
           throw new Error(`Tx-Repay partial not recoverable: not in your loan.status (older accept flow), not in lender ${lenderIa.slice(0,12)}'s current loan.match, AND not in their identity history. Cooperative manual recovery required (see SPEC §recovery).`);
         }
+        // Tier 3/4 recovers the match from the lender's multimap, which the
+        // lender controls. They could have overwritten tx_repay_partial with
+        // a hex that pays output 0 to an attacker address — the original
+        // accept-time verification doesn't protect us here. Re-run the same
+        // 7-point output check before signing+broadcasting.
+        //
+        // Match entries don't store match_iaddr (it's implicit: the entry
+        // sits in the lender's multimap). verifyMatchSafety resolves the
+        // lender via matchPayload.match_iaddr || requestPayload.target_lender_iaddr,
+        // and our `status` snapshot doesn't carry target_lender_iaddr either,
+        // so inject the known lender iaddr explicitly.
+        const recoveryErrors = await verifyMatchSafety({ ...matchPayload, match_iaddr: lenderIa }, status, acting);
+        if (recoveryErrors.length) {
+          throw new Error(`Recovered Tx-Repay failed safety check:\n  - ${recoveryErrors.join("\n  - ")}\nLender's loan.match may have been tampered with. Refusing to broadcast.`);
+        }
         // Make sure the wallet knows the vault P2SH so it can sign for it.
         const rs = _hexToBytes(matchPayload.vault_redeem_script);
         if (rs.length === 71 && rs[0] === 0x52 && rs[1] === 0x21 && rs[35] === 0x21 && rs[69] === 0x52 && rs[70] === 0xae) {

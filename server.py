@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VerusLending local web app server.
+"""make-gui local web app server.
 
 Stdlib-only HTTP server that:
   - Serves static files from ./static/
@@ -10,8 +10,13 @@ user's own VerusID multimap (encrypted) for anything that must survive
 across machines. No local DB.
 
 Run:
-  python3 app/server.py [--port 7777] [--conf ~/.komodo/VRSC/VRSC.conf]
+  python3 server.py [--port 7777] [--conf ~/.komodo/VRSC/VRSC.conf]
 Then open http://127.0.0.1:7777/
+
+Non-loopback binds (e.g. --bind 0.0.0.0): pass --token <secret> and have
+the client send X-Auth-Token: <secret> on POSTs. Without it the GUI is
+reachable by anyone on the network and CSRF alone won't stop direct HTTP
+clients.
 """
 
 import argparse
@@ -89,8 +94,13 @@ class Handler(BaseHTTPRequestHandler):
     # carrying a non-CORS-safelisted header trigger a preflight that the
     # server doesn't answer, so the browser blocks the actual request.
     # Same-origin (the GUI itself) sets the header, so it goes through.
+    # NOTE: CSRF is browser-only — it does not stop direct HTTP clients
+    # (curl, scripts) that can set arbitrary headers. For non-loopback
+    # binds, gate /rpc behind an additional shared secret via --token.
     CSRF_HEADER = "X-Requested-By"
     CSRF_VALUE = "vlocal"
+    AUTH_HEADER = "X-Auth-Token"
+    AUTH_TOKEN: str = ""  # set in main() from --token; empty = disabled
 
     # Method allowlist for /rpc. Strict subset of what the GUI actually
     # uses — anything else (dumpprivkey, walletpassphrase, sendtoaddress,
@@ -164,6 +174,10 @@ class Handler(BaseHTTPRequestHandler):
         # CSRF guard — must be set by same-origin JS in main.js.
         if self.headers.get(self.CSRF_HEADER) != self.CSRF_VALUE:
             return self._send_json(403, {"error": "missing csrf header"})
+        # Optional shared-secret gate, required when --token is set (typical
+        # for non-loopback binds where direct HTTP clients bypass CSRF).
+        if self.AUTH_TOKEN and self.headers.get(self.AUTH_HEADER) != self.AUTH_TOKEN:
+            return self._send_json(403, {"error": "missing or invalid auth token"})
 
         body = self._read_body()
         try:
@@ -232,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
         # Same CSRF guard as /rpc — only same-origin GUI may write.
         if self.headers.get(self.CSRF_HEADER) != self.CSRF_VALUE:
             return self._send_json(403, {"error": "missing csrf header"})
+        if self.AUTH_TOKEN and self.headers.get(self.AUTH_HEADER) != self.AUTH_TOKEN:
+            return self._send_json(403, {"error": "missing or invalid auth token"})
         body = self._read_body()
         try:
             parsed = json.loads(body)
@@ -255,13 +271,39 @@ def main():
     ap.add_argument(
         "--conf", default=str(Path.home() / ".komodo" / "VRSC" / "VRSC.conf")
     )
+    ap.add_argument(
+        "--token",
+        default="",
+        help="Shared secret required as X-Auth-Token on POSTs. "
+             "Strongly recommended when --bind is non-loopback.",
+    )
     args = ap.parse_args()
 
     Handler.rpc_cfg = read_rpc_config(Path(args.conf))
+    Handler.AUTH_TOKEN = args.token
+
+    # Loud warning when listening off loopback without an auth token: CSRF
+    # alone does not stop direct (non-browser) HTTP clients on the network
+    # from calling /rpc with signrawtransaction, dumpprivkey, etc.
+    if args.bind not in ("127.0.0.1", "::1", "localhost") and not args.token:
+        sys.stderr.write(
+            "\n⚠  SECURITY: --bind {} exposes /rpc on the network with no "
+            "auth token.\n".format(args.bind)
+            + "   The CSRF header check only blocks cross-origin browser "
+              "calls — not curl/scripts.\n"
+            + "   Anyone who can reach this host can call signrawtransaction, "
+              "dumpprivkey, etc.\n"
+            + "   Either bind to 127.0.0.1 (and use an SSH tunnel for "
+              "remote access)\n"
+            + "   or pass --token <secret> and have the client send "
+              "X-Auth-Token: <secret>.\n\n"
+        )
 
     httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"VerusLending app at http://{args.bind}:{args.port}/")
+    print(f"make-gui at http://{args.bind}:{args.port}/")
     print(f"  RPC → {Handler.rpc_cfg['rpchost']}:{Handler.rpc_cfg['rpcport']}")
+    if args.token:
+        print("  auth token: required on POSTs (X-Auth-Token)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
