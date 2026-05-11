@@ -36,6 +36,86 @@ function currencyOptions(selected = "VRSC") {
   return CURRENCIES.map((c) => `<option value="${c}"${c === selected ? " selected" : ""}>${c}</option>`).join("");
 }
 
+// ── Currency canonicalization (SCHEMA.md §2 currency rule) ───────────
+// On the wire, every currency field in protocol payloads MUST be a Verus
+// i-address — never a FQN, never a bare local name, never the "VRSC"
+// literal. FQN strings can be renamed (chain rename + scammer impersonation
+// risk); bare names are ambiguous across chains; i-addresses are unique
+// and immutable. UI accepts FQN for ergonomics; these helpers turn them
+// into wire-format on the way out, and look them up on the way in.
+
+const _ccyIaddrCache = new Map(); // FQN/name → i-address
+const _ccyDisplayCache = new Map(); // i-address → FQN
+
+const _IADDR_RE = /^i[1-9A-HJ-NP-Za-km-z]{33}$/;
+
+// User input → canonical i-address. Throws on ambiguous bare names so the
+// caller refuses to post a malformed payload. Cached.
+async function canonicalizeCurrency(input) {
+  if (!input || typeof input !== "string") throw new Error("currency required");
+  if (_IADDR_RE.test(input)) return input;  // already i-address
+  if (_ccyIaddrCache.has(input)) return _ccyIaddrCache.get(input);
+  // Reject bare local names that can be ambiguous (no '.'). VRSC is the
+  // single allowed shortcut; map it to its i-address.
+  if (input === "VRSC") {
+    const id = "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV";
+    _ccyIaddrCache.set(input, id);
+    _ccyDisplayCache.set(id, "VRSC");
+    return id;
+  }
+  if (!input.includes(".")) {
+    throw new Error(`Bare currency name '${input}' is ambiguous — use a fully-qualified name (e.g. '${input}.vETH') or an i-address`);
+  }
+  const c = await rpc("getcurrency", [input]).catch(() => null);
+  if (!c?.currencyid) throw new Error(`Unknown currency '${input}'`);
+  _ccyIaddrCache.set(input, c.currencyid);
+  _ccyDisplayCache.set(c.currencyid, c.fullyqualifiedname || c.name || input);
+  return c.currencyid;
+}
+
+// i-address → human-friendly name for display. Falls back to truncated
+// i-address if lookup fails (graceful degradation). Synchronous wrapper
+// that hits cache; call canonicalizeCurrency first to warm it for known
+// currencies, or use displayCurrencyAsync for one-off lookups.
+function displayCurrency(iaddr) {
+  if (!iaddr) return "?";
+  if (!_IADDR_RE.test(iaddr)) return iaddr;  // already a name; pass through
+  if (_ccyDisplayCache.has(iaddr)) return _ccyDisplayCache.get(iaddr);
+  return iaddr.slice(0, 12) + "…";  // short i-address fallback
+}
+
+async function displayCurrencyAsync(iaddr) {
+  if (!iaddr) return "?";
+  if (!_IADDR_RE.test(iaddr)) return iaddr;
+  if (_ccyDisplayCache.has(iaddr)) return _ccyDisplayCache.get(iaddr);
+  const c = await rpc("getcurrency", [iaddr]).catch(() => null);
+  const name = c?.fullyqualifiedname || c?.name || iaddr.slice(0, 12) + "…";
+  _ccyDisplayCache.set(iaddr, name);
+  return name;
+}
+
+// Walk a payload object and canonicalize every known currency field.
+// Used at post-time on offer/request/match/status/history payloads to
+// guarantee wire format. Returns a *copy* so callers don't mutate their
+// originals.
+async function canonicalizeCurrencyFields(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const p = JSON.parse(JSON.stringify(payload));  // deep clone
+  const fields = ["principal", "collateral", "repay", "max_principal"];
+  for (const f of fields) {
+    if (p[f] && typeof p[f] === "object" && p[f].currency) {
+      p[f].currency = await canonicalizeCurrency(p[f].currency);
+    }
+  }
+  if (Array.isArray(p.accepted_collateral)) {
+    p.accepted_collateral = await Promise.all(p.accepted_collateral.map(canonicalizeCurrency));
+  }
+  if (Array.isArray(p.allowed_collateral_currencies)) {
+    p.allowed_collateral_currencies = await Promise.all(p.allowed_collateral_currencies.map(canonicalizeCurrency));
+  }
+  return p;
+}
+
 // VDXF key transition: vrsc::contract.* → vcs::contract.*
 //
 // Canonical VDXF keys, all under the registered standard owner make.VRSC@
