@@ -3200,6 +3200,41 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         }
       }, 3000);
     } catch (e) {
+      // Diagnostic capture for #104 (first-click errors / retry works). Snap
+      // the panel dataset + cached request + recent rpc-trace into
+      // localStorage so we can read the actual state at failure time.
+      // Lightweight; only fires on error path.
+      try {
+        const panel = row.querySelector(".post-match-panel");
+        const requestKey = row.dataset.requestKey;
+        const r = requestByKey.get(requestKey);
+        const snapshot = {
+          t: Date.now(),
+          iso: new Date().toISOString(),
+          err: e?.message || String(e),
+          errStack: (e?.stack || "").split("\n").slice(0, 6).join(" | "),
+          panelDataset: panel ? { ...panel.dataset } : null,
+          requestKey,
+          requestCached: r ? {
+            iaddr: r.iaddr,
+            posted_tx: r.posted_tx,
+            target_lender_iaddr: r.target_lender_iaddr,
+            hasBorrowerInputSignedHex: !!r.borrower_input_signed_hex,
+            principal: r.principal,
+            collateral: r.collateral,
+          } : null,
+          stage: btn?.textContent,
+          uiTraceLast5: (() => {
+            try { return JSON.parse(localStorage.getItem("vl_ui_trace") || "[]").slice(-5); }
+            catch { return null; }
+          })(),
+        };
+        const ring = JSON.parse(localStorage.getItem("vl_postmatch_err") || "[]");
+        ring.push(snapshot);
+        while (ring.length > 20) ring.shift();
+        localStorage.setItem("vl_postmatch_err", JSON.stringify(ring));
+        console.warn("[post-match-err] captured to localStorage.vl_postmatch_err", snapshot);
+      } catch {}
       resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
       btn.disabled = false;
       btn.textContent = "Retry";

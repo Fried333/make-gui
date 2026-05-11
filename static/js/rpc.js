@@ -2,7 +2,38 @@
 
 let nextId = 1;
 
+// Diagnostic: trace every updateidentity call to help track down the
+// "borrower cm goes empty after Loan B request" mystery (#101). Logs the
+// caller location, the cm keys we're about to commit, the acting iaddr,
+// and a high-res timestamp to both the console AND a localStorage ring
+// buffer (so the trace survives a page-close).
+// Cheap (only runs for updateidentity, only does string ops). Remove once
+// the bug is found.
+function _traceUpdateIdentity(params) {
+  try {
+    const arg = (params || [])[0] || {};
+    const cm = arg.contentmultimap || {};
+    const cmKeys = Object.keys(cm);
+    const stack = (new Error().stack || "").split("\n").slice(2, 7).join(" | ");
+    const entry = {
+      t: Date.now(),
+      iso: new Date().toISOString(),
+      name: arg.name,
+      parent: arg.parent,
+      cmKeys,
+      cmEmpty: cmKeys.length === 0,
+      stack,
+    };
+    console.warn(`[ui-trace] updateidentity name=${arg.name} cmKeys=${JSON.stringify(cmKeys)}`, entry);
+    const ring = JSON.parse(localStorage.getItem("vl_ui_trace") || "[]");
+    ring.push(entry);
+    while (ring.length > 100) ring.shift();
+    localStorage.setItem("vl_ui_trace", JSON.stringify(ring));
+  } catch {}
+}
+
 export async function rpc(method, params = []) {
+  if (method === "updateidentity") _traceUpdateIdentity(params);
   const body = {
     jsonrpc: "1.0",
     id: nextId++,
