@@ -4020,7 +4020,8 @@ function runFormValidation(formEl) {
       : `<span style="color:var(--bad)">✗ collateral ratio ${ratio.toFixed(2)}× &lt; lender's required ${minRatio.toFixed(2)}×</span>`
     );
   }
-  out.innerHTML = messages.join("<br>");
+  out.innerHTML = messages.join("<br>")
+    + `<div class="collateral-suggestion muted" style="margin-top:4px;font-size:12px"></div>`;
 
   // Color the R-balance line based on the collateral check.
   if (balLine) balLine.style.color = collOk ? "var(--ok)" : "var(--bad)";
@@ -4034,7 +4035,92 @@ function runFormValidation(formEl) {
                   : ratioFail ? "Collateral ratio below lender's minimum"
                   : "";
   }
+
+  // Oracle-based collateral suggestion. Async; updates the .collateral-suggestion
+  // div once estimateconversion returns. Debounced via the form's own dataset.
+  updateCollateralSuggestion(formEl);
 }
+
+// Debounced async oracle quote. Pulls estimateconversion from the local
+// daemon to compute "at current price, X principal = Y collateral; for
+// min_ratio coverage you'd want Y × ratio collateral." Renders into
+// .collateral-suggestion. No-op if the form lacks the relevant fields.
+let _suggestionDebounce = null;
+function updateCollateralSuggestion(formEl) {
+  clearTimeout(_suggestionDebounce);
+  _suggestionDebounce = setTimeout(() => doUpdateCollateralSuggestion(formEl), 400);
+}
+async function doUpdateCollateralSuggestion(formEl) {
+  const sugEl = formEl.querySelector(".collateral-suggestion");
+  if (!sugEl) return;
+  const principalAmt = parseFloat(formEl.querySelector('[data-f="principal_amount"]')?.value || "0");
+  const principalCcy = formEl.querySelector('[data-f="principal_currency"]')?.value;
+  const collCcy      = formEl.querySelector('[data-f="collateral_currency"]')?.value;
+  const minRatio     = parseFloat(formEl.dataset.minCollateralRatio || "2.0");
+
+  if (!principalAmt || !principalCcy || !collCcy) { sugEl.textContent = ""; return; }
+
+  // Same-currency: 1:1, just multiply by ratio.
+  if (principalCcy === collCcy) {
+    const suggested = principalAmt * minRatio;
+    sugEl.innerHTML = `Suggested collateral for ${minRatio}× coverage: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code> `
+      + `<button class="ghost" type="button" data-act="apply-suggested" data-val="${suggested}" style="font-size:11px;padding:2px 8px;margin-left:6px">Use this</button>`;
+    return;
+  }
+
+  // Cross-currency: ask local daemon. estimateconversion takes
+  // {currency, amount, convertto} and returns estimatedcurrencyout (how
+  // much of `convertto` you'd get for `amount` of `currency`). For
+  // collateral suggestion we want the opposite direction: how much of
+  // collCcy equals principalAmt of principalCcy. So query A→B and
+  // multiply principalAmt by the rate.
+  sugEl.textContent = "checking current rate…";
+
+  // Try direct conversion first; if the chain says "Source currency cannot
+  // be converted to destination" (no single basket holds both), retry via
+  // the common reserve baskets in priority order. Bridge.vETH covers most
+  // vETH-side currencies + VRSC; vARRR/vDEX baskets cover their native
+  // pairs; Pure covers tBTC routes when Bridge baskets are starved.
+  const VIAS = [null, "Bridge.vETH", "Bridge.vARRR", "Bridge.vDEX", "Pure"];
+  let quote = null;
+  let viaUsed = null;
+  let lastErr = null;
+  for (const via of VIAS) {
+    try {
+      const params = { currency: principalCcy, amount: principalAmt, convertto: collCcy };
+      if (via) params.via = via;
+      const q = await rpc("estimateconversion", [params]);
+      if (q?.estimatedcurrencyout && parseFloat(q.estimatedcurrencyout) > 0) {
+        quote = q; viaUsed = via; break;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!quote) {
+    sugEl.innerHTML = `<span style="color:var(--muted)">⚠ no on-chain conversion route ${escapeHtml(principalCcy)} → ${escapeHtml(collCcy)} (tried direct + bridges) — set collateral manually</span>`;
+    return;
+  }
+  const principalInCollCcy = parseFloat(quote.estimatedcurrencyout);
+  const suggested = principalInCollCcy * minRatio;
+  const viaLabel = viaUsed ? ` <span class="muted" style="font-size:11px">via ${escapeHtml(viaUsed)}</span>` : "";
+  sugEl.innerHTML = `At current rate, ${principalAmt} ${escapeHtml(principalCcy)} ≈ ${principalInCollCcy.toFixed(4)} ${escapeHtml(collCcy)}${viaLabel}. `
+    + `Suggested ${minRatio}× collateral: <code>${suggested.toFixed(4)} ${escapeHtml(collCcy)}</code> `
+    + `<button class="ghost" type="button" data-act="apply-suggested" data-val="${suggested.toFixed(4)}" style="font-size:11px;padding:2px 8px;margin-left:6px">Use this</button>`;
+}
+
+// Click handler for "Use this" inside the suggestion. Sets the
+// collateral_amount field and re-runs validation so the row updates.
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest('[data-act="apply-suggested"]');
+  if (!btn) return;
+  const formEl = btn.closest('#mp-post-form');
+  if (!formEl) return;
+  const collInput = formEl.querySelector('[data-f="collateral_amount"]');
+  if (!collInput) return;
+  collInput.value = btn.dataset.val;
+  collInput.dispatchEvent(new Event("input", { bubbles: true }));
+});
 
 // Smart UTXO reuse: scan the wallet's locked UTXOs for one at borrowerR
 // that matches the requested currency + amount AND isn't already

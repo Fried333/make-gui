@@ -108,6 +108,7 @@ class Handler(BaseHTTPRequestHandler):
     ALLOWED_RPC = {
         "getinfo", "getblockcount", "getbestblockhash", "getblockheader",
         "getrawmempool", "getrawtransaction", "decoderawtransaction", "gettxout",
+        "estimateconversion",
         "createrawtransaction", "signrawtransaction", "sendrawtransaction",
         "getaddressbalance", "getaddressutxos", "getaddressmempool",
         "getaddresstxids",
