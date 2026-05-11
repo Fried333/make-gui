@@ -15,7 +15,7 @@ publishing on chain.
 | Loans tab — counterparty traffic (known parties) | ✓ | — | `getidentity <them> -1` for anyone in your watch list |
 | Marketplace tab — discover others' offers | — | ✓ | `/api/contracts/loans/offers` |
 | Marketplace tab — directed-request discovery | partial | partial | watch-list daemon walk + explorer fallback |
-| Reputation history (full settled-loan list) | — | ✓ | explorer walks `identity_history` for past `loan.history` entries |
+| Trade history history (full settled-loan list) | — | ✓ | explorer walks `identity_history` for past `loan.history` entries |
 | Post a request / offer / match | ✓ | — | `signrawtransaction` + `updateidentity` |
 | Accept a match (broadcast Tx-A) | ✓ | — | `sendrawtransaction` |
 | Repay (broadcast Tx-Repay) | ✓ | — | `sendrawtransaction` |
@@ -77,7 +77,7 @@ marketplace, expect ~75 seconds total for an offer to appear network-wide
   asked about that address. If you care, run your own indexer (it's
   open source) or just don't visit those endpoints.
 
-## Reputation: chain-derived, no GUI dependency
+## Trade history: chain-derived, no GUI dependency
 
 After Phases 1–5 of the soft-delete cleanup:
 - On settle, both parties' identities have **`loan.history`** entries (size-1
@@ -85,11 +85,11 @@ After Phases 1–5 of the soft-delete cleanup:
   prior identity revisions.
 - The explorer walks `identity_history` to surface every past settled
   loan for any identity. **Both parties' attestations** count toward
-  reputation, so a loan shows up on the lender's view even if their
+  trade history, so a loan shows up on the lender's view even if their
   attestation watcher wasn't running when the borrower repaid (cross-party
-  reputation aggregation).
+  trade-history summary).
 
-You don't have to keep your GUI open to "earn" reputation. The chain
+You don't have to keep your GUI open to "earn" trade history. The chain
 records every settlement; the explorer aggregates from chain.
 
 ## Failure modes

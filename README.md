@@ -33,7 +33,7 @@ Anyone can fork, extend, or replace it — the chain is the source of truth.
   via `localStorage.vl_auto_fund_enabled = "1"`
 - **Active loans tab** — lists open loans on local identities, with a
   Repay button that auto-splits a clean repayment UTXO, extends Tx-Repay,
-  broadcasts, and posts `loan.history` for credit-score reputation
+  broadcasts, and posts `loan.history` for trade history
 - **Auto-split via `sendcurrency`** — no UTXO management; the GUI splits
   fresh single-currency UTXOs in mempool for clean signing. Chained
   parent-child broadcasts settle without confirmation waits
@@ -81,7 +81,7 @@ State model:
   `getidentity <iaddr> -1`).
 - **Explorer API**: stranger discovery only — used by the Marketplace
   tab to find offers from parties you haven't met yet, and to walk
-  full reputation history. The Loans tab is **daemon-only** — works
+  full settlement history. The Loans tab is **daemon-only** — works
   even if the explorer is down.
 - **Chain**: ultimate source of truth. Local + explorer are derivative.
 
