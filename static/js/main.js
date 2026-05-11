@@ -2460,6 +2460,7 @@ function renderMarketOffer(r, mySet, myMap, acting) {
          data-offer-max-principal="${(r.max_principal && r.max_principal.amount) || ""}"
          data-offer-principal-ccy="${escapeHtml((r.max_principal && r.max_principal.currency) || "")}"
          data-offer-min-ratio="${r.min_collateral_ratio ?? ""}"
+         data-offer-target-ratio="${r.target_collateral_ratio ?? r.min_collateral_ratio ?? ""}"
          data-offer-collaterals="${escapeHtml((r.accepted_collateral || []).join(","))}">
       <div class="row">
         <strong style="flex:1">${escapeHtml(prefillName)}</strong>
@@ -2749,13 +2750,19 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const lenderIa = row.dataset.iaddr;
     const offerCcy = row.dataset.offerPrincipalCcy || "VRSC";
     const offerMaxAmt = parseFloat(row.dataset.offerMaxPrincipal || "5") || 5;
-    const offerRatio  = parseFloat(row.dataset.offerMinRatio || "2") || 2;
+    const offerMinRatio    = parseFloat(row.dataset.offerMinRatio || "2") || 2;
+    // Borrower posts at TARGET (what the lender actually wants); lender's
+    // auto-fund accepts down to MIN (target × (1 - slippage)). For legacy
+    // offers without target_collateral_ratio, fall back to min — the
+    // borrower over-commits by the slippage cushion but the post still
+    // matches.
+    const offerTargetRatio = parseFloat(row.dataset.offerTargetRatio || row.dataset.offerMinRatio || "2") || 2;
     const offerTerm   = parseInt(row.dataset.offerTerm || "30") || 30;
     const offerRate   = parseFloat(row.dataset.offerRate || "0.01");
     const offerCols   = (row.dataset.offerCollaterals || "").split(",").filter(Boolean);
     const principal = Math.min(offerMaxAmt, 5);                  // start small by default
     const collateralCcy = offerCols[0] || "VRSC";
-    const collateral = +(principal * offerRatio).toFixed(8);
+    const collateral = +(principal * offerTargetRatio).toFixed(8);
     // Rate is interpreted as a flat percentage for the term (not APR).
     // Lender posting "1% over 30 days" means repay = principal × 1.01.
     // Same lender posting "1% over 7 days" also means repay × 1.01 — the
@@ -2770,8 +2777,10 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       collateral_currency: collateralCcy,
       repay_amount: repay,
       term_days: offerTerm,
-      min_collateral_ratio: offerRatio,  // form validation gates Preview on collateral/principal ≥ this
-      accepted_collateral: offerCols,    // restricts the collateral_currency dropdown to what the lender accepts
+      // Borrower's GUI uses this for the oracle suggestion (post at target);
+      // form validation also gates Preview on actual/principal ≥ this.
+      min_collateral_ratio: offerTargetRatio,
+      accepted_collateral: offerCols,
     });
     return;
   }
@@ -4648,21 +4657,26 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     vdxfId = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz";
     const collateralBtns = formEl.querySelectorAll(".collateral-toggle .ctog.selected");
     const autoFund = formEl.querySelector('[data-f="auto_fund"]')?.checked || false;
-    // Effective minimum on the wire = target × (1 - slippage/100). UI
-    // shows both inputs but the protocol payload only carries the single
-    // derived floor (cleaner spec, simpler match-time check).
+    // Two ratio fields on the wire:
+    //   target_collateral_ratio — what the lender ACTUALLY wants (borrower
+    //                             should post at this multiple)
+    //   min_collateral_ratio    — what the lender will auto-accept after
+    //                             allowing for price drift (target × (1 - slippage))
+    // Borrower GUIs read target_collateral_ratio for the suggestion; lender
+    // auto-fund matchers read min_collateral_ratio for the accept gate.
     const targetRatio = parseFloat(f("target_ratio")) || 0;
     const slippagePct = parseFloat(f("slippage_pct")) || 0;
     const minCollateralRatio = targetRatio * (1 - slippagePct / 100);
     payload = {
       version: 1,
-      max_principal:        { currency: f("max_principal_currency"), amount: parseFloat(f("max_principal_amount")) },
-      accepted_collateral:  Array.from(collateralBtns).map((b) => b.dataset.cur),
-      min_collateral_ratio: minCollateralRatio,
-      rate:                 parseFloat(f("rate")),
-      term_days:            parseInt(f("term_days"), 10),
-      auto_fund:            autoFund,
-      active:               true,
+      max_principal:           { currency: f("max_principal_currency"), amount: parseFloat(f("max_principal_amount")) },
+      accepted_collateral:     Array.from(collateralBtns).map((b) => b.dataset.cur),
+      target_collateral_ratio: targetRatio,
+      min_collateral_ratio:    minCollateralRatio,
+      rate:                    parseFloat(f("rate")),
+      term_days:               parseInt(f("term_days"), 10),
+      auto_fund:               autoFund,
+      active:                  true,
     };
   } else {
     return;
