@@ -320,25 +320,36 @@ function _parseTx(hex) {
   const remainder = b.slice(off);
   return { fOverwintered, nVersion, nVersionGroupId, vins, vouts, nLockTime, nExpiryHeight, remainder };
 }
-// Parse a 2-of-2 P2SH-multisig scriptSig of the canonical shape
-// `OP_0 <push sig1> <push sig2 OR OP_0> <push redeem>`. Returns
-// {sig1, sig2, redeem} as Uint8Arrays; sig2 may be null when the slot
-// is unsigned (single-sig partial).
+// Parse a 2-of-2 P2SH-multisig scriptSig by walking pushes. Handles
+// both forms that Verus emits:
+//   3-element:  OP_0 push(sig1) push(redeem)            — sig2 missing entirely
+//   4-element:  OP_0 push(sig1) (OP_0 | push(sig2)) push(redeem)
+// Returns {sig1, sig2, redeem}; sig2 is null when the slot is empty.
 function _parseMultisigScriptSig(scriptSig) {
+  const elements = [];
   let off = 0;
-  if (scriptSig[off] !== 0x00) throw new Error("multisig scriptSig must start with OP_0");
-  off += 1;
-  const len1 = scriptSig[off]; off += 1;
-  if (len1 < 0x01 || len1 > 0x4b) throw new Error(`sig1 push length out of range: ${len1}`);
-  const sig1 = scriptSig.slice(off, off + len1); off += len1;
-  let sig2 = null;
-  if (scriptSig[off] === 0x00) { off += 1; }
-  else {
-    const len2 = scriptSig[off]; off += 1;
-    sig2 = scriptSig.slice(off, off + len2); off += len2;
+  while (off < scriptSig.length) {
+    const op = scriptSig[off]; off += 1;
+    if (op === 0x00) { elements.push(null); continue; }
+    if (op >= 0x01 && op <= 0x4b) {
+      elements.push(scriptSig.slice(off, off + op));
+      off += op;
+      continue;
+    }
+    if (op === 0x4c) { // OP_PUSHDATA1
+      const len = scriptSig[off]; off += 1;
+      elements.push(scriptSig.slice(off, off + len));
+      off += len;
+      continue;
+    }
+    throw new Error(`unsupported scriptSig opcode 0x${op.toString(16)} at off ${off - 1}`);
   }
-  const lenR = scriptSig[off]; off += 1;
-  const redeem = scriptSig.slice(off, off + lenR); off += lenR;
+  if (elements.length < 3) throw new Error(`scriptSig has ${elements.length} elements, expected 3 or 4`);
+  if (elements[0] !== null) throw new Error("scriptSig must start with OP_0 (multisig dummy)");
+  const redeem = elements[elements.length - 1];
+  if (!redeem || redeem.length === 0) throw new Error("redeem script not found in scriptSig");
+  const sig1 = elements[1] || null;
+  const sig2 = elements.length === 4 ? elements[2] : null;
   return { sig1, sig2, redeem };
 }
 
@@ -363,14 +374,55 @@ async function _addBorrowerSigToPartial(partialHex, borrowerWif, prevtxsHint, si
   // 1. Extract lender's sig from the partial.
   const partialTx = _parseTx(partialHex);
   const { sig1: lenderSig, redeem } = _parseMultisigScriptSig(partialTx.vins[0].scriptSig);
+  if (!lenderSig || lenderSig.length < 64 || lenderSig.length > 73) {
+    throw new Error(`lender sig from partial has invalid length ${lenderSig?.length} — expected 64-73`);
+  }
+  if (!redeem || redeem.length === 0) throw new Error("partial scriptSig missing redeem script");
   // 2. Ask the wallet to sign — borrower's sig will appear in slot 1 of
   //    the result. The lender's sig in the input is clobbered; we don't
   //    care, we already have it.
   const r = await rpc("signrawtransaction", [partialHex, prevtxsHint, [borrowerWif], sighash]);
   const signedTx = _parseTx(r.hex);
-  const { sig1: borrowerSig } = _parseMultisigScriptSig(signedTx.vins[0].scriptSig);
+  const { sig1: borrowerSig, redeem: borrowerRedeem } = _parseMultisigScriptSig(signedTx.vins[0].scriptSig);
+  if (!borrowerSig || borrowerSig.length < 64 || borrowerSig.length > 73) {
+    throw new Error(`borrower sig from signrawtransaction has invalid length ${borrowerSig?.length}`);
+  }
+  // The redeem script the wallet emitted must match the one we extracted
+  // from the lender's partial (same vault).
+  if (_bytesToHex(borrowerRedeem) !== _bytesToHex(redeem)) {
+    throw new Error("redeem script mismatch between partial and wallet sign result");
+  }
+  // Each sig's last byte is the sighash flag; must match what we asked
+  // for. `SINGLE|ANYONECANPAY` = 0x83. Drop-in mismatch would mean the
+  // lender signed a different commitment than the borrower's verifying.
+  const expectedSighashByte = sighash === "SINGLE|ANYONECANPAY" ? 0x83 :
+                              sighash === "ALL"                 ? 0x01 :
+                              sighash === "ALL|ANYONECANPAY"    ? 0x81 :
+                              sighash === "NONE|ANYONECANPAY"   ? 0x82 :
+                              null;
+  if (expectedSighashByte != null) {
+    if (lenderSig[lenderSig.length - 1] !== expectedSighashByte) {
+      throw new Error(`lender sig sighash byte 0x${lenderSig[lenderSig.length-1].toString(16)} != expected 0x${expectedSighashByte.toString(16)}`);
+    }
+    if (borrowerSig[borrowerSig.length - 1] !== expectedSighashByte) {
+      throw new Error(`borrower sig sighash byte 0x${borrowerSig[borrowerSig.length-1].toString(16)} != expected 0x${expectedSighashByte.toString(16)}`);
+    }
+  }
   // 3. Compose final scriptSig: OP_0 lenderSig borrowerSig redeem.
   partialTx.vins[0].scriptSig = _composeMultisigScriptSig(lenderSig, borrowerSig, redeem);
+  // 4. Round-trip the merged scriptSig: parse it back, verify it has
+  //    EXACTLY 4 elements (OP_0, sig1, sig2, redeem) and the same redeem.
+  //    Belt-and-suspenders: if the composer or parser has a bug, we
+  //    catch it here, not at sendrawtransaction time.
+  const check = _parseMultisigScriptSig(partialTx.vins[0].scriptSig);
+  if (!check.sig1 || !check.sig2 || !check.redeem) {
+    throw new Error("merged scriptSig missing expected element after compose");
+  }
+  if (_bytesToHex(check.sig1) !== _bytesToHex(lenderSig) ||
+      _bytesToHex(check.sig2) !== _bytesToHex(borrowerSig) ||
+      _bytesToHex(check.redeem) !== _bytesToHex(redeem)) {
+    throw new Error("merged scriptSig round-trip mismatch — compose/parse drift");
+  }
   return _serializeTx(partialTx);
 }
 
