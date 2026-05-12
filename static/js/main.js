@@ -1083,6 +1083,19 @@ if (showStaleEl) {
   };
 }
 
+// Lender's local opt-in for auto-fund. The offer's auto_fund=true is
+// the lender's declared intent; this flag is "I'm at the wallet right
+// now, broadcasts may fire without further prompting". Without it, the
+// watcher detects candidates but stops at the confirm step.
+const LS_KEY_AUTO_FUND = "vl_auto_fund_enabled";
+const autoFundEl = document.getElementById("mp-auto-fund-toggle");
+if (autoFundEl) {
+  autoFundEl.checked = localStorage.getItem(LS_KEY_AUTO_FUND) === "1";
+  autoFundEl.onchange = () => {
+    localStorage.setItem(LS_KEY_AUTO_FUND, autoFundEl.checked ? "1" : "0");
+  };
+}
+
 // Two-level picker:
 //   R-address (your wallet root) → list of IDs under that R
 // If the chosen R has a single ID, the ID picker hides.
@@ -2489,6 +2502,7 @@ function renderMarketRequest(r, mySet, myMap, acting) {
       <div class="row">
         <strong style="flex:1">${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
         <span class="badge loan-request">Loan request</span>
+        ${r.auto_accept ? `<span class="badge" style="margin-left:6px;background:#1f4e3a;color:#a8e9c5" title="Borrower's GUI will auto-broadcast Tx-A if the lender's match passes its safety check — no second click needed">🤖 Auto-accept</span>` : ""}
         ${isActing ? `<span class="badge yours" style="margin-left:6px">yours</span>` : mine ? `<span class="badge muted" style="margin-left:6px">local</span>` : ""}
       </div>
       <div class="kv">
@@ -2537,13 +2551,14 @@ function renderMarketOffer(r, mySet, myMap, acting) {
       <div class="row">
         <strong style="flex:1">${escapeHtml(prefillName)}</strong>
         <span class="badge loan-offer">Loan offer</span>
+        ${r.auto_fund ? `<span class="badge" style="margin-left:6px;background:#1f4e3a;color:#a8e9c5" title="Lender's GUI will auto-post a loan.match for requests that fit (slippage ${r.slippage_pct ?? 1}% accept floor)">🤖 Auto-fund</span>` : ""}
         ${isActing ? `<span class="badge yours" style="margin-left:6px">yours</span>` : mine ? `<span class="badge muted" style="margin-left:6px">local</span>` : ""}
       </div>
       <div class="kv">
         <div><span class="k">max</span><span class="v">${maxVrsc != null ? `${maxVrsc} VRSC` : formatAmount(r.max_principal)}</span></div>
         <div><span class="k">lends</span><span class="v">${escapeHtml(lendCcys.map(displayCurrency).join(", ") || "—")}</span></div>
         <div><span class="k">accepts</span><span class="v">${escapeHtml((r.accepted_collateral || []).map(displayCurrency).join(", ") || "—")}</span></div>
-        <div><span class="k">ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}×</span></div>
+        <div><span class="k">ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}× <span class="muted" style="font-size:11px">(accept ≥ ${(r.min_collateral_ratio * (1 - (r.slippage_pct ?? 1) / 100)).toFixed(2)}× w/ ${r.slippage_pct ?? 1}% drift)</span></span></div>
         <div><span class="k">rate</span><span class="v">${r.rate != null ? (r.rate * 100).toFixed(1) + "%" : "?"}</span></div>
         <div><span class="k">term</span><span class="v">${escapeHtml(r.term_days ?? "?")} days</span></div>
       </div>
@@ -2854,7 +2869,9 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       term_days: offerTerm,
       // Borrower's GUI uses these for validation: ratio for collateral
       // check, max_vrsc for principal cap, lend/accept lists for dropdown
-      // restriction.
+      // restriction. `rate` lets the repay field auto-track principal
+      // edits (repay = principal × (1 + rate)).
+      rate:                 offerRate,
       min_collateral_ratio: offerRatio,
       max_principal_vrsc:   offerMaxVrsc,
       lend_currencies:      lendCcys,
@@ -3192,9 +3209,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       let exact = null;
       {
         btn.textContent = "Splitting UTXO via sendcurrency…";
+        // Quantize to 8 decimals — float-precision drift in any upstream
+        // arithmetic (e.g. oracle suggestion × ratio) can leak bits and
+        // make sendcurrency reject the amount as "Invalid amount".
+        const principalAmtSan = Math.round(principalAmt * 1e8) / 1e8;
         const out = _isVrscNative(principalCcy)
-          ? [{ address: lenderR, amount: principalAmt }]
-          : [{ currency: principalCcy, amount: principalAmt, address: lenderR }];
+          ? [{ address: lenderR, amount: principalAmtSan }]
+          : [{ currency: principalCcy, amount: principalAmtSan, address: lenderR }];
         const opid = await rpc("sendcurrency", [lenderR, out]);
         let splitTxid = null;
         for (let i = 0; i < 30 && !splitTxid; i++) {
@@ -4065,6 +4086,15 @@ async function openMarketPostForm(kind, prefill) {
     if (prefill.max_principal_vrsc != null) {
       formEl.dataset.maxPrincipalVrsc = String(prefill.max_principal_vrsc);
     }
+    // Stash the offer rate so the repay field auto-tracks principal
+    // changes via principal × (1 + rate). Mark the prefilled repay value
+    // as auto-set so we know whether subsequent rewrites are safe
+    // (user manual edit → stop auto-tracking on that field).
+    if (prefill.rate != null) {
+      formEl.dataset.offerRate = String(prefill.rate);
+      const repayInput = formEl.querySelector('[data-f="repay_amount"]');
+      if (repayInput) repayInput.dataset.lastAutoVal = repayInput.value;
+    }
     // Restrict the principal_currency dropdown to the lender's
     // lend_currencies set. Borrower can only borrow what's on offer.
     if (Array.isArray(prefill.lend_currencies) && prefill.lend_currencies.length > 0) {
@@ -4366,6 +4396,30 @@ document.addEventListener("input", (ev) => {
   const slp = parseFloat(form.querySelector('[data-f="slippage_pct"]')?.value) || 0;
   const out = form.querySelector('.effective-min-display code');
   if (out) out.textContent = `${(m * (1 - slp / 100)).toFixed(4)}×`;
+});
+
+// Borrower's request form: keep repay_amount in sync with principal_amount
+// using the offer's rate, unless the borrower has manually edited repay
+// (in which case we stop auto-tracking that field — same lastAutoVal
+// pattern applySuggestedCollateral uses for collateral).
+document.addEventListener("input", (ev) => {
+  const t = ev.target;
+  if (!t.matches?.('#mp-post-form [data-f="principal_amount"]')) return;
+  const form = t.closest('#mp-post-form');
+  if (!form) return;
+  const rate = parseFloat(form.dataset.offerRate || "");
+  if (!isFinite(rate)) return;
+  const repayInput = form.querySelector('[data-f="repay_amount"]');
+  if (!repayInput) return;
+  const lastAuto = repayInput.dataset.lastAutoVal;
+  if (lastAuto !== undefined && repayInput.value !== lastAuto) return;  // user edited; stop tracking
+  const principal = parseFloat(t.value);
+  if (!isFinite(principal) || principal <= 0) return;
+  const next = (principal * (1 + rate)).toFixed(4);
+  if (repayInput.value === next) { repayInput.dataset.lastAutoVal = next; return; }
+  repayInput.value = next;
+  repayInput.dataset.lastAutoVal = next;
+  repayInput.dispatchEvent(new Event("input", { bubbles: true }));
 });
 
 // Smart UTXO reuse: scan the wallet's locked UTXOs for one at borrowerR
@@ -4672,7 +4726,10 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     //    locked UTXO from a previously-cancelled request happens to
     //    match the same currency + amount — reuse it. Reuse keeps cancel
     //    + repost cycles from leaving stranded lockunspent reservations.
-    const splitAmount = collateralAmount + 0.0001;
+    // Quantize to exactly 8 decimals — JS float addition leaks bits
+    // (e.g. 2.5046 + 0.0001 → 2.5046999999999998), and sendcurrency
+    // rejects amounts that don't round-trip cleanly through its 8-dp parser.
+    const splitAmount = (Math.round(collateralAmount * 1e8) + 10000) / 1e8;
     let borrowerInputTxid, borrowerInputVout = -1;
     const reusable = await findReusableSplitUtxo(iaddr, borrowerR, collateralCurrency, splitAmount).catch(() => null);
     if (reusable) {
@@ -5496,10 +5553,15 @@ async function enrichActiveLoanBalances() {
       //     repayAmt of the loan currency for the lender's output, AND
       //     0.0001 VRSC fully consumed as the network fee.
       const FEE_VRSC = 0.0001;
+      // Quantize repay amount to 8dp; float arithmetic from non-integer
+      // rates (e.g. 5 × 1.0157 = 5.0785) can leak bits below 8dp that
+      // sendcurrency parses as Invalid amount.
+      const repayAmtSan = Math.round(repayAmt * 1e8) / 1e8;
+      const splitOutTotal = (Math.round(repayAmtSan * 1e8) + 10000) / 1e8;
       const splitOut = _isVrscNative(repayCcy)
-        ? [{ address: borrowerR, amount: repayAmt + FEE_VRSC }]
+        ? [{ address: borrowerR, amount: splitOutTotal }]
         : [
-            { currency: repayCcy, amount: repayAmt, address: borrowerR },
+            { currency: repayCcy, amount: repayAmtSan, address: borrowerR },
             { address: borrowerR, amount: FEE_VRSC },
           ];
       const opid = await rpc("sendcurrency", [borrowerR, splitOut]);
