@@ -320,6 +320,60 @@ function _parseTx(hex) {
   const remainder = b.slice(off);
   return { fOverwintered, nVersion, nVersionGroupId, vins, vouts, nLockTime, nExpiryHeight, remainder };
 }
+// Parse a 2-of-2 P2SH-multisig scriptSig of the canonical shape
+// `OP_0 <push sig1> <push sig2 OR OP_0> <push redeem>`. Returns
+// {sig1, sig2, redeem} as Uint8Arrays; sig2 may be null when the slot
+// is unsigned (single-sig partial).
+function _parseMultisigScriptSig(scriptSig) {
+  let off = 0;
+  if (scriptSig[off] !== 0x00) throw new Error("multisig scriptSig must start with OP_0");
+  off += 1;
+  const len1 = scriptSig[off]; off += 1;
+  if (len1 < 0x01 || len1 > 0x4b) throw new Error(`sig1 push length out of range: ${len1}`);
+  const sig1 = scriptSig.slice(off, off + len1); off += len1;
+  let sig2 = null;
+  if (scriptSig[off] === 0x00) { off += 1; }
+  else {
+    const len2 = scriptSig[off]; off += 1;
+    sig2 = scriptSig.slice(off, off + len2); off += len2;
+  }
+  const lenR = scriptSig[off]; off += 1;
+  const redeem = scriptSig.slice(off, off + lenR); off += lenR;
+  return { sig1, sig2, redeem };
+}
+
+function _composeMultisigScriptSig(sig1, sig2, redeem) {
+  const out = new Uint8Array(1 + 1 + sig1.length + 1 + sig2.length + 1 + redeem.length);
+  let p = 0;
+  out[p++] = 0x00;              // OP_0 dummy
+  out[p++] = sig1.length; out.set(sig1, p); p += sig1.length;
+  out[p++] = sig2.length; out.set(sig2, p); p += sig2.length;
+  out[p++] = redeem.length; out.set(redeem, p); p += redeem.length;
+  return out;
+}
+
+// Add the borrower's vault-half sig to a lender-pre-signed Tx-Repay / Tx-B.
+// Verus's signrawtransaction REPLACES slot-1 instead of filling slot-2
+// when re-signing a 2-of-2 P2SH partial, so the borrower can't rely on
+// the wallet to "just" add their sig. Instead: call signrawtransaction to
+// get the borrower's sig (which lands in slot 1), then manually compose
+// the final scriptSig with lender's original sig in slot 1 and borrower's
+// freshly-computed sig in slot 2.
+async function _addBorrowerSigToPartial(partialHex, borrowerWif, prevtxsHint, sighash) {
+  // 1. Extract lender's sig from the partial.
+  const partialTx = _parseTx(partialHex);
+  const { sig1: lenderSig, redeem } = _parseMultisigScriptSig(partialTx.vins[0].scriptSig);
+  // 2. Ask the wallet to sign — borrower's sig will appear in slot 1 of
+  //    the result. The lender's sig in the input is clobbered; we don't
+  //    care, we already have it.
+  const r = await rpc("signrawtransaction", [partialHex, prevtxsHint, [borrowerWif], sighash]);
+  const signedTx = _parseTx(r.hex);
+  const { sig1: borrowerSig } = _parseMultisigScriptSig(signedTx.vins[0].scriptSig);
+  // 3. Compose final scriptSig: OP_0 lenderSig borrowerSig redeem.
+  partialTx.vins[0].scriptSig = _composeMultisigScriptSig(lenderSig, borrowerSig, redeem);
+  return _serializeTx(partialTx);
+}
+
 function _serializeTx(tx) {
   const parts = [];
   const versionRaw = ((tx.nVersion & 0x7fffffff) | ((tx.fOverwintered & 1) << 31)) >>> 0;
@@ -3655,14 +3709,23 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       }];
 
       // Complete Tx-Repay: borrower adds their vault-half → 2-of-2 done.
+      // Verus's signrawtransaction clobbers slot 1 of the lender's pre-
+      // signed partial when the wallet's matching pubkey is in slot 2,
+      // and never fills slot 2 — see _addBorrowerSigToPartial. That
+      // helper extracts the lender's slot-1 sig, signs to obtain the
+      // borrower's sig, and composes the correct final scriptSig with
+      // both sigs in their pubkey-aligned slots.
+      const borrowerInfo = await rpc("getidentity", [acting, -1]);
+      const borrowerR = (borrowerInfo?.identity?.primaryaddresses || [])[0];
+      if (!borrowerR) throw new Error(`could not resolve borrower's primary R from ${acting}`);
+      const borrowerWif = await rpc("dumpprivkey", [borrowerR]);
       btn.textContent = "Completing Tx-Repay 2-of-2…";
-      const repaySigned = await rpc("signrawtransaction", [r.tx_repay_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
-      if (!repaySigned.complete) throw new Error("Tx-Repay did not complete: " + JSON.stringify(repaySigned.errors || {}));
+      const repayMergedHex = await _addBorrowerSigToPartial(r.tx_repay_partial, borrowerWif, prevtxsHint, "SINGLE|ANYONECANPAY");
+      const repaySigned = { hex: repayMergedHex, complete: true };
 
-      // Complete Tx-B similarly.
       btn.textContent = "Completing Tx-B 2-of-2…";
-      const bSigned = await rpc("signrawtransaction", [r.tx_b_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
-      if (!bSigned.complete) throw new Error("Tx-B did not complete: " + JSON.stringify(bSigned.errors || {}));
+      const bMergedHex = await _addBorrowerSigToPartial(r.tx_b_partial, borrowerWif, prevtxsHint, "SINGLE|ANYONECANPAY");
+      const bSigned = { hex: bMergedHex, complete: true };
 
       // Pre-flight: confirm every non-borrower input on Tx-A is still
       // unspent. The pre-signed Tx-A only commits to chain on sendraw, but
@@ -5520,9 +5583,12 @@ async function enrichActiveLoanBalances() {
           redeemScript: matchPayload.vault_redeem_script,
           amount: parseFloat(status.collateral?.amount ?? vaultOut.value),
         }];
-        const repaySigned = await rpc("signrawtransaction", [matchPayload.tx_repay_partial, prevtxsHint, null, "SINGLE|ANYONECANPAY"]);
-        if (!repaySigned.complete) throw new Error("Tx-Repay vault-half re-sign incomplete: " + JSON.stringify(repaySigned.errors || {}));
-        txRepayHex = repaySigned.hex;
+        // Verus signrawtransaction clobbers the lender's slot-1 sig
+        // when re-signing a 2-of-2 partial; use the manual merge helper
+        // that preserves both sigs in their pubkey-aligned slots.
+        const _bR = (idInfo?.identity?.primaryaddresses || [])[0];
+        const _bWif = await rpc("dumpprivkey", [_bR]);
+        txRepayHex = await _addBorrowerSigToPartial(matchPayload.tx_repay_partial, _bWif, prevtxsHint, "SINGLE|ANYONECANPAY");
         try { localStorage.setItem(`vl_tx_repay_${loanId}`, txRepayHex); } catch {}
       }
 
