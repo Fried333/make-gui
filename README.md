@@ -32,7 +32,28 @@ Anyone can fork, extend, or replace it — the chain is the source of truth.
   1.5× hard floor). Wallet stays unlocked, GUI signs locally — never
   holds keys server-side. The offer's `auto_fund` flag is the lender's
   declared consent; to pause, cancel the offer or re-post with
-  `auto_fund: false`.
+  `auto_fund: false`. Counterparties see a `🤖 Auto-fund` badge on the
+  offer card so they know what to expect.
+- **Borrower auto-accept (per-request)** — borrower's request can carry
+  `auto_accept: true` (the "Auto-confirm if the lender's match honors
+  these exact terms" checkbox on the request form). When the lender
+  posts a `loan.match`, the borrower's GUI runs a 7-check safety
+  verification on the match against the original request:
+  - principal/collateral/repay amounts match (8-dp exact, integer
+    satoshi)
+  - principal output pays the borrower's R; repay + Tx-B outputs pay
+    the lender's R; vault output address matches the P2SH derived
+    from both pubkeys
+  - maturity_block ≤ today + term_days × 1440 (chain-wall protection
+    against a malicious lender setting an impossibly-distant maturity)
+  - currencies match between request and match (i-address compare,
+    SCHEMA.md §2)
+
+  If all seven checks pass, Tx-A broadcasts automatically — no second
+  click. If anything fails, the match surfaces in Inbox for manual
+  review. The flag is on-chain in the request payload; to pause, cancel
+  + re-post with the checkbox off. Counterparties see a `🤖 Auto-accept`
+  badge on the request card.
 - **Active loans tab** — lists open loans on local identities, with a
   Repay button that auto-splits a clean repayment UTXO, extends Tx-Repay,
   broadcasts, and posts `loan.history` for trade history
