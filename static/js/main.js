@@ -2640,19 +2640,18 @@ function renderMarketOffer(r, mySet, myMap, acting) {
          data-offer-max-vrsc="${maxVrsc ?? ""}"
          data-offer-lend="${escapeHtml(lendCcys.join(","))}"
          data-offer-min-ratio="${r.min_collateral_ratio ?? ""}"
-         data-offer-slippage-pct="${r.slippage_pct ?? ""}"
          data-offer-collaterals="${escapeHtml((r.accepted_collateral || []).join(","))}">
       <div class="row">
         <strong style="flex:1">${escapeHtml(prefillName)}</strong>
         <span class="badge loan-offer">Loan offer</span>
-        ${r.auto_fund ? `<span class="badge" style="margin-left:6px;background:#1f4e3a;color:#a8e9c5" title="Lender's GUI will auto-post a loan.match for requests that fit (slippage ${r.slippage_pct ?? 1}% accept floor)">🤖 Auto-fund</span>` : ""}
+        ${r.auto_fund ? `<span class="badge" style="margin-left:6px;background:#1f4e3a;color:#a8e9c5" title="Lender's GUI will auto-post a loan.match for requests that fit this offer's terms">🤖 Auto-fund</span>` : ""}
         ${isActing ? `<span class="badge yours" style="margin-left:6px">yours</span>` : mine ? `<span class="badge muted" style="margin-left:6px">local</span>` : ""}
       </div>
       <div class="kv">
         <div><span class="k">max</span><span class="v">${maxVrsc != null ? `${maxVrsc} VRSC` : formatAmount(r.max_principal)}</span></div>
         <div><span class="k">lends</span><span class="v">${escapeHtml(lendCcys.map(displayCurrency).join(", ") || "—")}</span></div>
         <div><span class="k">accepts</span><span class="v">${escapeHtml((r.accepted_collateral || []).map(displayCurrency).join(", ") || "—")}</span></div>
-        <div><span class="k">ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}× <span class="muted" style="font-size:11px">(accept ≥ ${(r.min_collateral_ratio * (1 - (r.slippage_pct ?? 1) / 100)).toFixed(2)}× w/ ${r.slippage_pct ?? 1}% drift)</span></span></div>
+        <div><span class="k">ratio</span><span class="v">${r.min_collateral_ratio?.toFixed?.(2) ?? "?"}×</span></div>
         <div><span class="k">rate</span><span class="v">${r.rate != null ? (r.rate * 100).toFixed(1) + "%" : "?"}</span></div>
         <div><span class="k">term</span><span class="v">${escapeHtml(r.term_days ?? "?")} days</span></div>
       </div>
@@ -4698,12 +4697,12 @@ function renderOfferFormBody() {
     </div>
     <div class="row" style="margin-top:8px">
       <label style="flex:1">Min collateral ratio<input type="number" data-f="min_ratio" value="2" step="0.1" /></label>
-      <label style="flex:1">Slippage tolerance %<input type="number" data-f="slippage_pct" value="1" step="0.5" /></label>
+      <label style="flex:1">Slippage tolerance % <span class="muted" style="font-size:10px">(local only)</span><input type="number" data-f="slippage_pct" value="${parseFloat(localStorage.getItem('vl_auto_fund_slippage_pct') ?? '1')}" step="0.5" /></label>
       <label style="flex:1">Rate (decimal)<input type="number" data-f="rate" value="0.01" step="0.001" /></label>
     </div>
     <div class="muted" style="font-size:11px;margin-top:-4px">
       Auto-fund accept floor: <span class="effective-min-display"><code>1.9800×</code></span>
-      <span class="muted">— derived as ratio × (1 − slippage%); never displayed to the borrower</span>
+      <span class="muted">— derived locally from your slippage setting; not on chain, not shown to the borrower.</span>
     </div>
     <div class="row"><label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label></div>
     <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2)">
@@ -4959,18 +4958,22 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     //   min_collateral_ratio — what the borrower must post (and what's
     //                          displayed everywhere). The lender's auto-fund
     //                          accept floor is DERIVED at runtime as
-    //                          min_ratio × (1 − slippage_pct/100), so no
-    //                          drift-cushion value ever leaks into the
-    //                          public offer payload.
+    //                          min_ratio × (1 − slippage_pct/100). slippage
+    //                          is a LOCAL wallet preference (localStorage),
+    //                          never on chain — it's how strict THIS wallet
+    //                          is about firing auto-fund, not a counterparty
+    //                          commitment.
     const minRatio    = parseFloat(f("min_ratio")) || 0;
-    const slippagePct = parseFloat(f("slippage_pct")) || 0;
+    const slippagePct = parseFloat(f("slippage_pct"));
+    if (isFinite(slippagePct) && slippagePct >= 0) {
+      try { localStorage.setItem("vl_auto_fund_slippage_pct", String(slippagePct)); } catch {}
+    }
     payload = {
       version: 1,
       max_principal_vrsc:   parseFloat(f("max_principal_vrsc")) || 0,
       lend_currencies:      Array.from(lendBtns).map((b) => b.dataset.cur),
       accepted_collateral:  Array.from(collateralBtns).map((b) => b.dataset.cur),
       min_collateral_ratio: minRatio,
-      slippage_pct:         slippagePct,
       rate:                 parseFloat(f("rate")),
       term_days:            parseInt(f("term_days"), 10),
       auto_fund:            autoFund,
@@ -7057,16 +7060,17 @@ async function validateAutoFundCandidate(req, offer) {
     return reasons;
   }
   const actualRatio = collAmt / principalInCollCcy;
-  // Accept floor = stated ratio × (1 − slippage_pct/100), derived here so
-  // the lender's drift cushion never appears in the public offer payload.
-  // Default slippage 1% if the offer doesn't specify.
+  // Accept floor = stated ratio × (1 − slippage_pct/100). slippage is a
+  // local wallet preference (localStorage), never on the wire — it's how
+  // strict THIS wallet is about firing auto-fund. Default 1% if unset.
   const minRatio    = parseFloat(offer.min_collateral_ratio ?? 0);
-  const slippagePct = parseFloat(offer.slippage_pct ?? 1);
+  const lsSlip      = parseFloat(localStorage.getItem("vl_auto_fund_slippage_pct") ?? "");
+  const slippagePct = isFinite(lsSlip) && lsSlip >= 0 ? lsSlip : 1;
   const acceptFloor = minRatio * (1 - slippagePct / 100);
   if (actualRatio < HARD_FLOOR_RATIO) {
     reasons.push(`ratio ${actualRatio.toFixed(2)} below hard floor ${HARD_FLOOR_RATIO}`);
   } else if (actualRatio < acceptFloor) {
-    reasons.push(`ratio ${actualRatio.toFixed(2)} < accept floor ${acceptFloor.toFixed(2)} (offer min ${minRatio} × (1−${slippagePct}%))`);
+    reasons.push(`ratio ${actualRatio.toFixed(2)} < local accept floor ${acceptFloor.toFixed(2)} (offer min ${minRatio} × (1−${slippagePct}% local slippage))`);
   }
 
   return reasons;
