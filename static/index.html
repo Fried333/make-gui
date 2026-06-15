@@ -6,13 +6,115 @@
   <link rel="stylesheet" href="/css/style.css" />
 </head>
 <body>
+  <!-- First-load disclaimer banner. Dismissed via localStorage["vl_terms_acked"];
+       persistent across reloads once acknowledged. -->
+  <div id="terms-banner" style="display:none;background:#3a1a1a;border-bottom:2px solid #c44;padding:12px 18px;color:#fdd;font-size:13px;line-height:1.5">
+    <strong style="color:#fff;font-size:14px">⚠ NO WARRANTY — USE AT YOUR OWN RISK.</strong>
+    This is open-source software with no entity behind it. Prices may be wrong. Code may have bugs. No one will reimburse you if you lose funds.
+    Read the <a href="/TERMS.md" target="_blank" style="color:#fdd;text-decoration:underline">Terms</a> and
+    <a href="/METHODOLOGY.md" target="_blank" style="color:#fdd;text-decoration:underline">Methodology</a>.
+    <button id="terms-ack-btn" class="primary" style="float:right;margin-left:12px">I understand</button>
+  </div>
+
   <header>
     <h1>VerusLending</h1>
     <nav>
       <button data-section="market" class="active">Loans</button>
     </nav>
     <div id="status">connecting…</div>
+    <button id="settings-btn" class="ghost" style="margin-left:8px;flex:0 0 auto;font-size:13px" title="Settings: API endpoint, auto-execute consent, kill-switch">⚙ Settings</button>
   </header>
+
+  <!-- Settings modal. Hidden by default; toggled by #settings-btn. -->
+  <div id="settings-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.6);align-items:center;justify-content:center">
+    <div style="background:var(--bg);border:1px solid #30363d;border-radius:8px;padding:24px;width:90%;max-width:620px;max-height:90vh;overflow:auto">
+      <div class="row" style="margin-bottom:16px;align-items:center">
+        <h2 style="margin:0;flex:1">Settings</h2>
+        <button class="ghost" id="settings-close" style="flex:0 0 auto">✕</button>
+      </div>
+
+      <h3 style="margin-top:8px">Explorer API</h3>
+      <p style="font-size:13px;color:var(--muted);margin:6px 0">
+        Marketplace data is fetched from a public indexer. You can point at your own
+        (the <code>verusexplorer-prod</code> repo runs one). Pricing always comes from
+        your local daemon — see <a href="/METHODOLOGY.md" target="_blank">METHODOLOGY.md</a>.
+      </p>
+      <div class="row" style="gap:6px;align-items:center;margin-bottom:6px">
+        <input id="settings-explorer-url" type="text" style="flex:1;padding:6px;font-family:monospace;font-size:13px" />
+        <button class="ghost" id="settings-explorer-test" style="flex:0 0 auto">Test</button>
+        <button class="primary" id="settings-explorer-save" style="flex:0 0 auto">Save</button>
+        <button class="ghost" id="settings-explorer-reset" style="flex:0 0 auto" title="Reset to default (scan.verus.cx)">↺</button>
+      </div>
+      <div id="settings-explorer-status" style="font-size:12px;color:var(--muted);min-height:1.4em;margin-bottom:16px"></div>
+
+      <h3 style="margin-top:8px">Auto-execute</h3>
+      <p style="font-size:13px;color:var(--muted);margin:6px 0">
+        Auto-fund (lender) and auto-accept (borrower) delegate trade decisions
+        to your browser based on oracle-derived collateral ratios. See
+        <a href="/TERMS.md" target="_blank">TERMS.md §3</a> for the heightened
+        risk these features carry. The opt-in modal that gated your first
+        activation is recorded in your consent log below.
+      </p>
+      <div class="row" style="gap:8px;align-items:center;margin-bottom:8px">
+        <label style="display:flex;gap:8px;align-items:center;font-size:14px;margin:0;cursor:pointer">
+          <input type="checkbox" id="settings-auto-paused" style="margin:0">
+          <strong>Pause auto-execute</strong> — temporarily stop auto-fund and auto-accept watchers without dropping consent.
+        </label>
+      </div>
+      <div id="settings-consent-record" style="font-size:12px;color:var(--muted);margin-bottom:16px;font-family:monospace;background:#0e1116;padding:8px;border-radius:4px;border:1px solid #30363d"></div>
+
+      <h3 style="margin-top:8px">Oracle sanity check</h3>
+      <p style="font-size:13px;color:var(--muted);margin:6px 0">
+        Cross-check oracle quotes against offer terms before auto-executing. Refuses
+        trades when the implied collateral ratio is outside [0.7×, 1.5×] of the offer's
+        stated ratio, or when the borrower's and lender's quotes diverge by &gt;5%.
+      </p>
+      <label style="display:flex;gap:8px;align-items:center;font-size:14px;margin:0;cursor:pointer;margin-bottom:16px">
+        <input type="checkbox" id="settings-oracle-sanity" style="margin:0">
+        Enable oracle sanity check (recommended)
+      </label>
+
+      <h3 style="margin-top:8px">Documents</h3>
+      <p style="font-size:13px;color:var(--muted);margin:6px 0">
+        <a href="/TERMS.md" target="_blank">Terms of Use</a> ·
+        <a href="/METHODOLOGY.md" target="_blank">Oracle Methodology</a> ·
+        <a href="https://github.com/Fried333/make-protocol" target="_blank">Protocol spec</a>
+      </p>
+    </div>
+  </div>
+
+  <!-- First-time auto-execute opt-in modal. Fires before enabling auto-fund/auto-accept the first time. -->
+  <div id="auto-consent-modal" style="display:none;position:fixed;inset:0;z-index:1001;background:rgba(0,0,0,0.7);align-items:center;justify-content:center">
+    <div style="background:var(--bg);border:1px solid #30363d;border-radius:8px;padding:24px;width:90%;max-width:620px;max-height:90vh;overflow:auto">
+      <h2 style="margin:0 0 12px 0;color:#f88">⚠ Enable auto-execute</h2>
+      <p style="font-size:13px;line-height:1.5">
+        You are about to enable a feature that will sign and broadcast
+        on-chain transactions on your behalf, without prompting at the
+        moment of execution. Decisions are made automatically based on
+        oracle-derived prices that may be inaccurate, stale, or unavailable.
+        Read <a href="/TERMS.md" target="_blank">TERMS.md §3</a> carefully
+        before continuing.
+      </p>
+      <div id="auto-consent-checks" style="margin:14px 0;padding:10px;border:1px solid #30363d;border-radius:4px;background:#0e1116">
+        <label style="display:block;margin:6px 0;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-consent="oracle"> I understand the oracle may produce inaccurate, stale, or unavailable prices.
+        </label>
+        <label style="display:block;margin:6px 0;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-consent="waiver"> I waive all warranties regarding oracle accuracy and software behavior.
+        </label>
+        <label style="display:block;margin:6px 0;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-consent="liability"> I accept full responsibility for any losses resulting from auto-execution.
+        </label>
+        <label style="display:block;margin:6px 0;font-size:13px;cursor:pointer">
+          <input type="checkbox" data-consent="killswitch"> I know how to disable auto-execute (Settings → "Pause auto-execute") and accept that monitoring my active loans is my responsibility.
+        </label>
+      </div>
+      <div class="row" style="gap:8px;justify-content:flex-end">
+        <button class="ghost" id="auto-consent-cancel" style="flex:0 0 auto">Cancel</button>
+        <button class="primary" id="auto-consent-confirm" style="flex:0 0 auto" disabled>I agree — enable auto-execute</button>
+      </div>
+    </div>
+  </div>
 
   <main>
 

@@ -81,7 +81,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_static("/index.html")
         if self.path == "/history-cache":
             return self._handle_history_cache_get()
+        # Expose the human-readable docs at the repo root so the Settings
+        # modal's <a href="/TERMS.md"> and <a href="/METHODOLOGY.md"> links
+        # resolve without copy-into-static.
+        if self.path in ("/TERMS.md", "/METHODOLOGY.md", "/README.md"):
+            return self._serve_repo_doc(self.path[1:])
         return self._serve_static(self.path)
+
+    def _serve_repo_doc(self, name):
+        path = APP_DIR / name
+        if not path.is_file():
+            self._send_json(404, {"error": f"{name} not found"})
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         if self.path == "/rpc":

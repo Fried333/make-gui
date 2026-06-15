@@ -32,14 +32,55 @@ function _traceUpdateIdentity(params) {
   } catch {}
 }
 
+// Short-TTL coalesce cache for read-only RPCs that loadMarket may call
+// 5+ times for the same args within one render cycle. Each loadMarket on a
+// slow daemon (.44 over SSH tunnel ≈ 1.3s per getidentity) was making 5
+// sequential getidentity(iaddr,-1) calls for the same iaddr — total 6-8s
+// just for the daemon walk. Coalescing collapses concurrent identical
+// calls to one promise + 2s result reuse. Write/state-mutating methods
+// (updateidentity, sendrawtransaction, sendcurrency, signrawtransaction,
+// dumpprivkey, addmultisigaddress, z_*) bypass entirely.
+const COALESCE_METHODS = new Set([
+  "getidentity",
+  "getidentityhistory",
+  "getaddressutxos",
+  "getaddressbalance",
+  "getaddressmempool",
+  "getrawmempool",
+  "getblockcount",
+  "getinfo",
+  "validateaddress",
+  "listidentities",
+  "gettxout",
+  "getrawtransaction",
+  "createmultisig",
+  "estimateconversion",
+  "decoderawtransaction",
+]);
+const COALESCE_TTL_MS = 2000;
+const _rpcCache = new Map();   // key → { at, result }
+const _rpcInflight = new Map(); // key → Promise
+
 export async function rpc(method, params = []) {
   if (method === "updateidentity") _traceUpdateIdentity(params);
+
+  // Coalesce path for read-only methods.
+  let cacheKey = null;
+  if (COALESCE_METHODS.has(method)) {
+    cacheKey = method + ":" + JSON.stringify(params);
+    const cached = _rpcCache.get(cacheKey);
+    if (cached && (Date.now() - cached.at) < COALESCE_TTL_MS) return cached.result;
+    const inflight = _rpcInflight.get(cacheKey);
+    if (inflight) return inflight;
+  }
+
   const body = {
     jsonrpc: "1.0",
     id: nextId++,
     method,
     params,
   };
+  const doFetch = (async () => {
   const res = await fetch("/rpc", {
     method: "POST",
     // X-Requested-By is the CSRF guard — the server rejects /rpc without it.
@@ -64,6 +105,15 @@ export async function rpc(method, params = []) {
     throw new Error(`${method}: ${json.error.message || JSON.stringify(json.error)}`);
   }
   return json.result;
+  })();
+  if (cacheKey) {
+    _rpcInflight.set(cacheKey, doFetch);
+    doFetch.then(
+      (result) => { _rpcCache.set(cacheKey, { at: Date.now(), result }); },
+      () => {} // errors not cached — let the next call retry
+    ).finally(() => { _rpcInflight.delete(cacheKey); });
+  }
+  return doFetch;
 }
 
 export async function ping() {

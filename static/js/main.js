@@ -14,7 +14,54 @@
 
 import { rpc, ping } from "./rpc.js";
 
-const EXPLORER_API = "https://scan.verus.cx/api";
+// Explorer API endpoint — configurable by the user via Settings.
+// Default: https://scan.verus.cx/api (run by the protocol maintainers as a
+// convenience). Users who run their own indexer (see verusexplorer-prod)
+// can point at it from Settings → Explorer API URL. The value is stored
+// in localStorage["vl_explorer_api"] and consumed at module load; changes
+// take effect on next page reload (Settings shows the reload prompt).
+//
+// Marketplace data is the ONLY thing this URL serves. Pricing comes
+// entirely from the local Verus daemon's estimateconversion RPC — see
+// METHODOLOGY.md.
+const EXPLORER_API_DEFAULT = "https://scan.verus.cx/api";
+const EXPLORER_API = (() => {
+  try {
+    const stored = localStorage.getItem("vl_explorer_api");
+    if (stored && /^https?:\/\//.test(stored)) return stored.replace(/\/$/, "");
+  } catch {}
+  return EXPLORER_API_DEFAULT;
+})();
+
+// Explorer fetch counter — instrumentation to find rate-limit hot spots.
+// Tracks each unique path's hit count + a moving window. Logs a summary
+// every 60s. Strip the variable parts (iaddrs, txids) for grouping.
+const _explorerHits = new Map(); // path-shape → { total, lastMin }
+const _explorerLog  = [];        // [{t, path}], pruned to last 600s
+function _recordExplorerHit(url) {
+  try {
+    const u = new URL(url);
+    // Normalize: keep pathname + query keys, drop values that vary per-call.
+    const params = Array.from(u.searchParams.keys()).sort().join(",");
+    const shape = `${u.pathname}?${params}`;
+    const cur = _explorerHits.get(shape) || { total: 0 };
+    cur.total += 1;
+    _explorerHits.set(shape, cur);
+    _explorerLog.push({ t: Date.now(), path: shape });
+    const cutoff = Date.now() - 600000;
+    while (_explorerLog.length && _explorerLog[0].t < cutoff) _explorerLog.shift();
+  } catch {}
+}
+setInterval(() => {
+  const last60s = _explorerLog.filter((e) => e.t > Date.now() - 60000);
+  const last10m = _explorerLog.length;
+  if (last10m === 0) return;
+  const byShape = {};
+  for (const e of last60s) byShape[e.path] = (byShape[e.path] || 0) + 1;
+  const top = Object.entries(byShape).sort((a, b) => b[1] - a[1]).slice(0, 6)
+    .map(([s, n]) => `${n}× ${s}`).join("  |  ");
+  console.warn(`[explorer-rate] last60s=${last60s.length} last10min=${last10m}/500 | top: ${top}`);
+}, 60000);
 
 // Common Verus currencies. SCHEMA.md §2: wire format is the i-address;
 // the FQN is display sugar only. Dropdown <option> values + collateral
@@ -1316,7 +1363,9 @@ async function fetchLoansByParty(address, state) {
     const tid = setTimeout(() => ctl.abort(), 8000);
     try {
       const stateQ = state ? `&state=${encodeURIComponent(state)}` : '';
-      const r = await fetch(`${EXPLORER_API}/contracts/loans/by-party?address=${encodeURIComponent(address)}${stateQ}&pageSize=200&include_mempool=true`, { signal: ctl.signal });
+      const _u = `${EXPLORER_API}/contracts/loans/by-party?address=${encodeURIComponent(address)}${stateQ}&pageSize=200&include_mempool=true`;
+      _recordExplorerHit(_u);
+      const r = await fetch(_u, { signal: ctl.signal });
       if (r.status === 429) {
         // Surface stale data if any; otherwise empty fallback
         return slot?.data || { results: [] };
@@ -1354,6 +1403,7 @@ async function fetchOneMarketTab(path) {
       const ctl = new AbortController();
       const tid = setTimeout(() => ctl.abort(), 8000);
       try {
+        _recordExplorerHit(`${EXPLORER_API}${path}`);
         const r = await fetch(`${EXPLORER_API}${path}`, { signal: ctl.signal });
         if (r.status === 429) {
           if (attempt === 0) {
@@ -1394,8 +1444,23 @@ async function fetchOneMarketTab(path) {
 // state OR any past identity revision).
 const _counterpartyWatchCache = new Map();   // iaddr → Set<counterpartyIaddr>
 
+// Walk identity history to find every iaddr we've ever interacted with
+// (request, match, status). Used to seed fetchLoansBundleDaemon's
+// counterparty-walk so we surface mempool-fresh entries from people we
+// know — before the explorer's confirmed-state index catches up.
+//
+// getidentityhistory(iaddr, 0, -1) returns ALL revisions; for chatty
+// identities this can be megabytes and seconds to fetch (especially via
+// an SSH tunnel where it competes for bandwidth with other RPCs). To
+// keep loadMarket fast, we cache results module-wide and refresh them
+// from a dedicated background ticker (see _refreshWatchListTicker below)
+// rather than on the hot path. Hot path returns whatever is cached;
+// empty cache → empty set, and the explorer's network-wide view
+// covers first-contact discovery.
 async function getCounterpartyWatchList(iaddr) {
-  if (_counterpartyWatchCache.has(iaddr)) return _counterpartyWatchCache.get(iaddr);
+  return _counterpartyWatchCache.get(iaddr) || new Set();
+}
+async function _populateCounterpartyWatchCache(iaddr) {
   const seen = new Set();
   try {
     const hist = await rpc("getidentityhistory", [iaddr, 0, -1]);
@@ -1704,7 +1769,19 @@ function invalidateMarketCache() {
   // fetch re-walks (catches counterparties added since last walk).
   _counterpartyWatchCache.clear();
 }
+// In-flight guard: serialize loadMarket so concurrent calls don't pile
+// RPCs on the daemon. Previously each call (init + picker.onchange + 30s
+// adaptive interval + tab clicks) fired its own ~10-20 getidentity calls
+// and they queued on the GUI server's /rpc endpoint, never finishing
+// within the test's 120s budget. Now: if already in flight, the new
+// caller awaits the existing promise instead of starting fresh.
+let _loadMarketPromise = null;
 async function loadMarket() {
+  if (_loadMarketPromise) return _loadMarketPromise;
+  _loadMarketPromise = _loadMarketImpl().finally(() => { _loadMarketPromise = null; });
+  return _loadMarketPromise;
+}
+async function _loadMarketImpl() {
   const myToken = ++_marketLoadToken;
   const el = document.getElementById("market-list");
   // Only show "Loading…" if the row list is currently empty. Otherwise
@@ -2359,6 +2436,7 @@ async function fetchJsonWithRetry(url, { useCacheFirst = false } = {}) {
   }
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      _recordExplorerHit(url);
       const r = await fetch(url);
       if (r.status === 429) {
         if (attempt < 2) {
@@ -2392,18 +2470,24 @@ async function enrichMatchRowTerms(rowEl, r, token) {
       try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
     }
     // Explorer fallback: only hit it if the daemon couldn't resolve.
+    // CRITICAL: when r.request.txid is known we must match it exactly — never
+    // fall back to "first result," that's how a stale draft from elsewhere
+    // ends up in loan.status (real loan = 5 DAI, status wrote = 1 DAI).
     if (!req) {
       const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
       if (cur) {
-        req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+        req = r.request.txid
+          ? (cur.results || []).find((x) => x.posted_tx === r.request.txid) || null
+          : (cur.results || [])[0] || null;
       }
     }
     if (!req) {
       // History fallback: the request may have been removed from current state
       const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
       if (hist) {
-        const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid)
-                || (hist.results || [])[0];
+        const ev = r.request.txid
+          ? (hist.results || []).find((x) => x.chain?.txid === r.request.txid) || null
+          : (hist.results || [])[0] || null;
         const p = ev?.entries?.[0]?.decoded;
         if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
       } else if (!cur) {
@@ -3114,22 +3198,27 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       if (!principalCcy || !principalAmt) throw new Error("request principal missing");
       // Aligned with the borrower's request flow: always auto-split a fresh
       // single-currency UTXO via sendcurrency, regardless of what the wallet
-      // currently holds. Predictable Tx-A skeleton building, no UTXO picker.
+      // currently holds. sendcurrency aggregates across UTXOs, so the gate
+      // is total balance ≥ principal, not any single UTXO ≥ principal.
       const utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
-      const candidates = utxos.filter((u) => {
-        const cv = u.currencyvalues || {};
-        if (principalCcy === "VRSC" || principalCcy === "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV") {
-          return u.satoshis >= principalSats;
+      const isVrscPrincipal = _isVrscNative(principalCcy);
+      let totalSats = 0;
+      for (const u of utxos) {
+        if (isVrscPrincipal) {
+          totalSats += u.satoshis;
+        } else {
+          const amt = parseFloat((u.currencyvalues || {})[principalCcy] || 0);
+          totalSats += Math.round(amt * 1e8);
         }
-        return Object.entries(cv).some(([k, v]) => k && parseFloat(v) >= principalAmt);
-      });
+      }
+      const hasBalance = totalSats >= principalSats;
       // Mark balance check as complete on the panel itself (survives the
       // innerHTML replacement below). The confirm-button enable gate further
       // down checks this alongside dataset.acting / vaultAddress — clicking
       // before *every* async dependency resolved is the #100/#104 race
       // pattern. Codifying each precondition explicitly so future additions
       // (e.g. pubkey, vault, balance) just add another flag here.
-      panel.dataset.balanceReady = candidates.length > 0 ? "1" : "0";
+      panel.dataset.balanceReady = hasBalance ? "1" : "0";
       panel.innerHTML = `
         <div class="review">
           <strong>Post a pre-signed match for ${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
@@ -3140,15 +3229,16 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
             <div><span class="k">acting as</span><span class="v">${escapeHtml(lenderInfo?.identity?.fullyqualifiedname || acting)}</span></div>
             <div><span class="k">vault P2SH</span><span class="v"><span class="muted vault-preview">computing…</span></span></div>
           </div>
-          ${candidates.length
+          ${hasBalance
             ? `<div style="margin-top:10px;font-size:12px;color:var(--muted)">Will split a fresh ${escapeHtml(principalCcy)} UTXO via sendcurrency, then post the match.</div>`
-            : `<div style="margin-top:10px;color:var(--bad);font-size:12px">No ${escapeHtml(principalCcy)} balance at ${escapeHtml(lenderR)} large enough to fund ${formatAmount(r.principal)}.</div>`}
-          ${candidates.length ? `<div class="row" style="margin-top:10px;gap:8px">
+            : `<div style="margin-top:10px;color:var(--bad);font-size:12px">Insufficient ${escapeHtml(principalCcy)} at ${escapeHtml(lenderR)} (${(totalSats / 1e8).toFixed(8)} available, need ${formatAmount(r.principal)}).</div>`}
+          ${hasBalance ? `<div class="row" style="margin-top:10px;gap:8px">
               <button class="primary" data-mp-row-act="post-match-go" style="flex:0 0 auto" disabled title="Loading…">Confirm — build, sign &amp; broadcast</button>
               <button class="ghost" data-mp-row-act="post-match-decline" style="flex:0 0 auto" title="Tell the borrower you're passing on this — writes a small loan.decline entry on your identity (≈0.0001 VRSC fee).">Decline</button>
               <button class="ghost" data-mp-row-act="post-match-cancel" style="flex:0 0 auto" title="Just close this panel (no on-chain signal — you can come back later).">Dismiss</button>
             </div>` : ""}
           <div class="post-match-result" style="margin-top:8px"></div>
+
         </div>
       `;
       // Compute vault P2SH async (cosmetic preview).
@@ -3574,22 +3664,30 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     // Reuse what enrichMatchRowTerms already resolved if present — saves a
     // round-trip and keeps Accept usable when the explorer is rate-limiting.
     let req = matchResolvedRequest.get(matchKey) || null;
+    // Prefer local daemon when we have a request_txid — it's authoritative and
+    // not subject to explorer indexing lag. Explorer/history are last-resort
+    // fallbacks if the daemon doesn't have the tx (e.g. pruned/cross-chain).
     try {
+      if (!req && r.request?.txid) {
+        try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
+      }
       if (!req) {
         const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
-        if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+        if (cur) {
+          req = r.request.txid
+            ? (cur.results || []).find((x) => x.posted_tx === r.request.txid) || null
+            : (cur.results || [])[0] || null;
+        }
       }
       if (!req) {
         const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
         if (hist) {
-          const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid) || (hist.results || [])[0];
+          const ev = r.request.txid
+            ? (hist.results || []).find((x) => x.chain?.txid === r.request.txid) || null
+            : (hist.results || [])[0] || null;
           const p = ev?.entries?.[0]?.decoded;
           if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
         }
-      }
-      // Local daemon fallback — works without the explorer.
-      if (!req && r.request?.txid) {
-        try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
       }
     } catch {}
     if (req) matchResolvedRequest.set(matchKey, req);
@@ -3748,8 +3846,28 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       try { await rpc("addmultisigaddress", [2, [pubA, pubB]]); } catch {}
 
       // Build prevtxs hint for the vault input (used by both Tx-Repay and Tx-B sigs).
-      const req = matchResolvedRequest.get(matchKey) || (r.request?.txid ? await fetchRequestFromLocalDaemon(r.request.txid).catch(() => null) : null);
+      // CRITICAL: prefer the authoritative local-daemon read over the cached
+      // matchResolvedRequest. The cache can hold stale data (e.g. an older
+      // draft request from the same iaddr) if explorer indexing lagged. Using
+      // the wrong principal/collateral here will write wrong values into
+      // loan.status downstream — observed as "5 DAI loan shows as 1 DAI".
+      let req = r.request?.txid ? await fetchRequestFromLocalDaemon(r.request.txid).catch(() => null) : null;
+      if (!req) req = matchResolvedRequest.get(matchKey) || null;
       if (!req?.collateral?.amount) throw new Error("collateral amount missing — refresh the marketplace and retry");
+      // Defense in depth: cross-check that Tx-A's vault output amount matches
+      // the resolved request's collateral. Catches any remaining mismatch
+      // (e.g. stale request from a different draft) before we commit wrong
+      // values to chain in loan.status. Native-VRSC collateral lives in the
+      // P2SH output's `value` field; reserve-currency collateral lives in
+      // currencyvalues and uses a different output shape — skip cross-check
+      // for those (would need full reserveBalance decode).
+      if (_isVrscNative(req.collateral?.currency)) {
+        const actualCollateralSats = decodedA.vout[vaultVout].valueSat ?? Math.round((decodedA.vout[vaultVout].value || 0) * 1e8);
+        const expectedCollateralSats = Math.round(parseFloat(req.collateral.amount) * 1e8);
+        if (Math.abs(actualCollateralSats - expectedCollateralSats) > 1) {
+          throw new Error(`request/Tx-A collateral mismatch: req=${expectedCollateralSats} sats, tx-a vault output=${actualCollateralSats} sats — refusing to write wrong loan.status`);
+        }
+      }
       const collateralAmt = parseFloat(req.collateral.amount);
       const prevtxsHint = [{
         txid: txATxid,
@@ -3804,6 +3922,9 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // Broadcast Tx-A.
       btn.textContent = "Broadcasting Tx-A…";
       const txABroadcastTxid = await rpc("sendrawtransaction", [r.tx_a_full]);
+      // Arm fast-follow: Tx-A in mempool, lender's settlement attestation
+      // + the loan moving to "active" state should show within a few blocks.
+      armFastFollow();
 
       // Stash Tx-Repay locally (browser localStorage keyed by Tx-A txid).
       // Will be retrieved later when borrower clicks Repay.
@@ -3927,15 +4048,27 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const resultEl = panel.querySelector(".accept-result") || panel;
     btn.disabled = true; btn.textContent = "Building Tx-A…";
     try {
-      // Reuse the already-resolved request if available.
+      // Reuse the already-resolved request if available. Prefer local daemon
+      // when we have request.txid (authoritative, no indexing lag). Explorer
+      // fallback must match txid exactly — falling back to "first result"
+      // here would write the wrong amounts into loan.status.
       let req = matchResolvedRequest.get(matchKey) || null;
+      if (!req && r.request?.txid) {
+        try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
+      }
       if (!req) {
         const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
-        if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+        if (cur) {
+          req = r.request.txid
+            ? (cur.results || []).find((x) => x.posted_tx === r.request.txid) || null
+            : (cur.results || [])[0] || null;
+        }
       }
       if (!req) {
         const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
-        const ev = (hist?.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid) || (hist?.results || [])[0];
+        const ev = r.request.txid
+          ? (hist?.results || []).find((x) => x.chain?.txid === r.request.txid) || null
+          : (hist?.results || [])[0] || null;
         const p = ev?.entries?.[0]?.decoded;
         if (p) req = p;
       }
@@ -4614,11 +4747,24 @@ function renderRequestFormBody() {
     <div class="muted" style="font-size:11px;margin-top:4px">Repay is paid in the same currency as the loan.</div>
     <div class="row" style="margin-top:6px">
       <label style="display:flex;gap:8px;align-items:center;cursor:pointer;font-size:12px">
-        <input type="checkbox" data-f="auto_accept" ${localStorage.getItem("vl_auto_accept") === "0" ? "" : "checked"} />
+        <input type="checkbox" data-f="auto_accept" data-arm="auto_accept_warn" />
         <span>Auto-confirm if the lender's match honors these exact terms</span>
       </label>
     </div>
     <div class="muted" style="font-size:11px;margin-top:-2px;margin-left:24px">When the lender posts a match: if the 7-check safety verification passes (recipients/amounts/maturity/vault all match this request), Tx-A is broadcast automatically — no second click needed. If anything is off, the match shows in Inbox for manual review.</div>
+    <div data-warn-for="auto_accept_warn" style="display:none;margin-top:10px;padding:10px;border:1px solid #c44;border-radius:6px;background:#3a1a1a;color:#fdd;font-size:12px;line-height:1.5">
+      <strong style="color:#fff;display:block;margin-bottom:4px">⚠ Before enabling auto-accept</strong>
+      Auto-accept will commit your collateral to a vault and broadcast Tx-A
+      without your explicit click. The safety checks compare the lender's
+      match against your request, but they can't catch every edge case —
+      buggy lender software, malformed partial transactions, or basket
+      starvation could still produce an unfavourable outcome.
+      <strong style="color:#fff">Only enable for amounts you can afford to lose.</strong>
+      <div class="row" style="gap:8px;margin-top:8px;align-items:center">
+        <button class="primary" data-confirm-warn="auto_accept_warn" style="flex:0 0 auto">Agree</button>
+        <button class="ghost"   data-cancel-warn="auto_accept_warn"  style="flex:0 0 auto">Disagree</button>
+      </div>
+    </div>
     <div class="row" style="margin-top:8px;gap:8px">
       <button class="primary" data-mp-do="preview-request" style="flex:0 0 auto">Preview &amp; sign</button>
       <button class="ghost"   data-mp-do="cancel" style="flex:0 0 auto">Cancel</button>
@@ -4707,13 +4853,27 @@ function renderOfferFormBody() {
     <div class="row"><label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label></div>
     <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg2)">
       <label style="display:flex;gap:8px;align-items:center;cursor:pointer">
-        <input type="checkbox" data-f="auto_fund" style="margin:0">
+        <input type="checkbox" data-f="auto_fund" data-arm="auto_fund_warn" style="margin:0">
         <strong>Auto-fund matching requests</strong>
-        <span class="muted" style="font-size:11px">— GUI polls every 30s and auto-posts a match when a request fits the criteria above</span>
+        <span class="muted" style="font-size:11px">— GUI polls every 15s and auto-posts a match when a request fits the criteria above</span>
       </label>
       <div class="muted" style="font-size:11px;margin-top:6px">
         Wallet must stay unlocked. Hard floor of 1.5× ratio applies regardless of your setting.
         Oracle pricing via local daemon's <code>estimateconversion</code>; if no on-chain route exists, that match is skipped.
+      </div>
+      <!-- Inline reminder. Appears under the checkbox when ticked; user must
+           explicitly confirm before the box stays checked. Reset on each tick. -->
+      <div data-warn-for="auto_fund_warn" style="display:none;margin-top:10px;padding:10px;border:1px solid #c44;border-radius:6px;background:#3a1a1a;color:#fdd;font-size:12px;line-height:1.5">
+        <strong style="color:#fff;display:block;margin-bottom:4px">⚠ Before enabling auto-fund</strong>
+        Even with the hard floor, oracle sanity check, and pause kill-switch,
+        the on-chain price oracle can still produce wrong, stale, or
+        manipulated quotes that the Software cannot fully filter out.
+        <strong style="color:#fff">Only enable auto-fund for amounts you can afford to lose.</strong>
+        Start small, watch the first few loans complete, scale up later.
+        <div class="row" style="gap:8px;margin-top:8px;align-items:center">
+          <button class="primary" data-confirm-warn="auto_fund_warn" style="flex:0 0 auto">Agree</button>
+          <button class="ghost"   data-cancel-warn="auto_fund_warn"  style="flex:0 0 auto">Disagree</button>
+        </div>
       </div>
     </div>
     <div class="row" style="margin-top:8px;gap:8px">
@@ -4726,6 +4886,34 @@ function renderOfferFormBody() {
 
 document.getElementById("mp-post-request").onclick = () => openMarketPostForm("request");
 document.getElementById("mp-post-offer").onclick   = () => openMarketPostForm("offer");
+
+// Inline-confirm pattern for risky checkboxes (data-arm="…"):
+//   1. user ticks the box → the matching [data-warn-for="<arm>"] block
+//      appears with a concrete reminder. Box stays ticked.
+//   2. user clicks "I agree" → block hides, box stays ticked.
+//   3. user clicks "Disagree" → block hides, box unticks.
+//   4. user unticks the box manually → block also hides.
+document.addEventListener("change", (e) => {
+  const cb = e.target;
+  if (!(cb instanceof HTMLInputElement) || cb.type !== "checkbox") return;
+  const arm = cb.dataset.arm;
+  if (!arm) return;
+  const warn = document.querySelector(`[data-warn-for="${arm}"]`);
+  if (!warn) return;
+  warn.style.display = cb.checked ? "block" : "none";
+});
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLButtonElement)) return;
+  const confirmArm = t.dataset.confirmWarn;
+  const cancelArm  = t.dataset.cancelWarn;
+  const arm = confirmArm || cancelArm;
+  if (!arm) return;
+  const cb   = document.querySelector(`input[data-arm="${arm}"]`);
+  const warn = document.querySelector(`[data-warn-for="${arm}"]`);
+  if (warn) warn.style.display = "none";
+  if (cb && cancelArm) cb.checked = false;  // Disagree unticks; Agree leaves as-is
+});
 
 // Handle preview / cancel / broadcast / collateral toggle inside the marketplace form
 document.getElementById("mp-post-form").addEventListener("click", async (ev) => {
@@ -4753,10 +4941,18 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       pendingMarketBroadcast = null;
       // Invalidate so the next loadMarket re-fetches and surfaces the new post.
       invalidateMarketCache();
-      // Auto-dismiss the form so the user isn't left staring at the preview.
+      // Arm fast-follow: we just posted something on chain, expect a
+      // counterparty reply (match if request, Tx-A if match). 5s polling
+      // for 5 min — user sees state changes without manual refresh.
+      armFastFollow();
+      // Auto-dismiss the form so the user isn't left staring at the preview,
+      // and switch to the Loans tab where the new request/offer + any
+      // incoming counterparty action will render. Staying on Marketplace
+      // means the user can't see their own post unless they click Loans.
       setTimeout(() => {
         formEl.style.display = "none";
         formEl.innerHTML = "";
+        document.querySelector('#market [data-mp-tab="loans"]')?.click();
       }, 2500);
       setTimeout(() => { loadIdentities(); loadMarket(); }, 3000);
     } catch (e) {
@@ -4929,9 +5125,20 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       return;
     }
 
-    // Read auto-accept preference and persist for next time
+    // Read auto-accept preference and persist for next time.
+    // Auto-execute requires a one-time consent acknowledgement — see TERMS.md §3.
+    // First-time enables fire the consent modal before the request goes on chain.
     const autoAcceptCheckbox = formEl.querySelector('[data-f="auto_accept"]');
-    const autoAccept = !!(autoAcceptCheckbox && autoAcceptCheckbox.checked);
+    let autoAccept = !!(autoAcceptCheckbox && autoAcceptCheckbox.checked);
+    if (autoAccept && !isAutoExecuteConsented()) {
+      const ok = await ensureAutoExecuteConsent();
+      if (!ok) {
+        if (autoAcceptCheckbox) autoAcceptCheckbox.checked = false;
+        autoAccept = false;
+        previewEl.innerHTML = `<div class="review" style="color:var(--muted)">Auto-accept disabled (consent declined). Posting as manual-accept; you'll need to click Accept on the resulting match.</div>`;
+        previewEl.style.display = "block";
+      }
+    }
     try { localStorage.setItem("vl_auto_accept", autoAccept ? "1" : "0"); } catch {}
 
     payload = {
@@ -4953,7 +5160,18 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
     vdxfId = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz";
     const lendBtns       = formEl.querySelectorAll(".lend-toggle .ctog.selected");
     const collateralBtns = formEl.querySelectorAll(".collateral-toggle .ctog.selected");
-    const autoFund = formEl.querySelector('[data-f="auto_fund"]')?.checked || false;
+    // Auto-execute requires a one-time consent acknowledgement — see TERMS.md §3.
+    const autoFundCheckbox = formEl.querySelector('[data-f="auto_fund"]');
+    let autoFund = !!(autoFundCheckbox && autoFundCheckbox.checked);
+    if (autoFund && !isAutoExecuteConsented()) {
+      const ok = await ensureAutoExecuteConsent();
+      if (!ok) {
+        if (autoFundCheckbox) autoFundCheckbox.checked = false;
+        autoFund = false;
+        previewEl.innerHTML = `<div class="review" style="color:var(--muted)">Auto-fund disabled (consent declined). Posting as manual-fund; you'll need to click Fund this loan when a matching request arrives.</div>`;
+        previewEl.style.display = "block";
+      }
+    }
     // Single ratio on the wire:
     //   min_collateral_ratio — what the borrower must post (and what's
     //                          displayed everywhere). The lender's auto-fund
@@ -5740,6 +5958,8 @@ async function enrichActiveLoanBalances() {
 
       btn.textContent = "Broadcasting Tx-Repay…";
       const repayBroadcastTxid = await rpc("sendrawtransaction", [signed.hex]);
+      // Arm fast-follow: vault drain + loan.history settlement updates incoming.
+      armFastFollow();
 
       // Post loan.history (settled = repaid) on borrower's identity for trade-history
       btn.textContent = "Posting loan.history (settled)…";
@@ -6490,10 +6710,207 @@ if (_activityRefreshBtn) {
   };
 }
 
+// ---------- Settings + consent ----------
+// localStorage keys for user-controlled config:
+//   vl_explorer_api     — custom marketplace indexer URL (default: scan.verus.cx)
+//   vl_auto_paused      — boolean; if true, auto-fund/auto-accept watchers no-op
+//   vl_oracle_sanity    — boolean; if true, refuse trades when oracle quote
+//                          falls outside [0.7×, 1.5×] of offer ratio
+//   vl_consent_log      — array of consent events; each {ts, version, checks}
+//
+// Consent is RECORDED LOCALLY ONLY — nothing is sent to any server.
+
+function _getConsentLog() {
+  try { return JSON.parse(localStorage.getItem("vl_consent_log") || "[]"); }
+  catch { return []; }
+}
+function _appendConsent(checks) {
+  const entry = {
+    ts: new Date().toISOString(),
+    version: (typeof window !== "undefined" && window.__SOFTWARE_VERSION) || "dev",
+    checks,
+  };
+  const log = _getConsentLog();
+  log.push(entry);
+  localStorage.setItem("vl_consent_log", JSON.stringify(log));
+  return entry;
+}
+function isAutoExecuteConsented() {
+  return _getConsentLog().length > 0;
+}
+function isAutoExecutePaused() {
+  return localStorage.getItem("vl_auto_paused") === "1";
+}
+function isOracleSanityEnabled() {
+  // Default ON.
+  return localStorage.getItem("vl_oracle_sanity") !== "0";
+}
+
+// Show the no-warranty banner on first load until the user acknowledges.
+// Persists via localStorage["vl_terms_acked"]; intentionally low-friction
+// (one button) because the modal-style consent only fires for auto-execute.
+(function initTermsBanner() {
+  const banner = document.getElementById("terms-banner");
+  const ackBtn = document.getElementById("terms-ack-btn");
+  if (!banner || !ackBtn) return;
+  if (localStorage.getItem("vl_terms_acked") === "1") return;
+  banner.style.display = "block";
+  ackBtn.onclick = () => {
+    localStorage.setItem("vl_terms_acked", "1");
+    banner.style.display = "none";
+  };
+})();
+
+// Initialise Settings panel UI on load.
+(function initSettings() {
+  const btn = document.getElementById("settings-btn");
+  const modal = document.getElementById("settings-modal");
+  if (!btn || !modal) return;
+  const urlInput = document.getElementById("settings-explorer-url");
+  const statusEl = document.getElementById("settings-explorer-status");
+  const pausedEl = document.getElementById("settings-auto-paused");
+  const consentEl = document.getElementById("settings-consent-record");
+  const sanityEl = document.getElementById("settings-oracle-sanity");
+
+  const renderConsent = () => {
+    const log = _getConsentLog();
+    if (log.length === 0) {
+      consentEl.textContent = "No consent on file. Auto-execute is disabled until you opt in via the modal that fires when you enable auto-fund or auto-accept on an offer/request.";
+    } else {
+      const latest = log[log.length - 1];
+      consentEl.textContent = `Consented at ${latest.ts} (version=${latest.version}, ${log.length} entry${log.length > 1 ? "ies" : ""} total).`;
+    }
+  };
+  const renderSettings = () => {
+    urlInput.value = EXPLORER_API;
+    pausedEl.checked = isAutoExecutePaused();
+    sanityEl.checked = isOracleSanityEnabled();
+    statusEl.textContent = "";
+    renderConsent();
+  };
+
+  btn.onclick = () => { modal.style.display = "flex"; renderSettings(); };
+  document.getElementById("settings-close").onclick = () => { modal.style.display = "none"; };
+  modal.onclick = (e) => { if (e.target === modal) modal.style.display = "none"; };
+
+  document.getElementById("settings-explorer-test").onclick = async () => {
+    const url = urlInput.value.trim().replace(/\/$/, "");
+    if (!/^https?:\/\//.test(url)) { statusEl.textContent = "✗ URL must start with http(s)://"; statusEl.style.color = "var(--bad)"; return; }
+    statusEl.textContent = "Testing…"; statusEl.style.color = "var(--muted)";
+    try {
+      const r = await fetch(`${url}/contracts/loans/offers?pageSize=1`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      if (!Array.isArray(j?.results)) throw new Error("response missing results[] array");
+      statusEl.textContent = `✓ Reachable (returned ${j.results.length} offer${j.results.length === 1 ? "" : "s"} as sample)`; statusEl.style.color = "var(--ok)";
+    } catch (e) {
+      statusEl.textContent = `✗ ${e.message}`; statusEl.style.color = "var(--bad)";
+    }
+  };
+  document.getElementById("settings-explorer-save").onclick = () => {
+    const url = urlInput.value.trim().replace(/\/$/, "");
+    if (!/^https?:\/\//.test(url)) { statusEl.textContent = "✗ URL must start with http(s)://"; statusEl.style.color = "var(--bad)"; return; }
+    localStorage.setItem("vl_explorer_api", url);
+    statusEl.textContent = "✓ Saved. Reload the page for the change to take effect."; statusEl.style.color = "var(--ok)";
+  };
+  document.getElementById("settings-explorer-reset").onclick = () => {
+    localStorage.removeItem("vl_explorer_api");
+    urlInput.value = EXPLORER_API_DEFAULT;
+    statusEl.textContent = "✓ Reset to default. Reload the page for the change to take effect."; statusEl.style.color = "var(--ok)";
+  };
+
+  pausedEl.onchange = () => {
+    if (pausedEl.checked) localStorage.setItem("vl_auto_paused", "1");
+    else localStorage.removeItem("vl_auto_paused");
+  };
+  sanityEl.onchange = () => {
+    if (sanityEl.checked) localStorage.removeItem("vl_oracle_sanity"); // default ON
+    else localStorage.setItem("vl_oracle_sanity", "0");
+  };
+})();
+
+// Returns true if user is allowed to fire auto-execute. Shows the opt-in
+// modal if they haven't consented yet, blocks until they confirm or cancel.
+async function ensureAutoExecuteConsent() {
+  if (isAutoExecuteConsented()) return true;
+  return new Promise((resolve) => {
+    const modal = document.getElementById("auto-consent-modal");
+    if (!modal) return resolve(false);
+    modal.style.display = "flex";
+    const confirmBtn = document.getElementById("auto-consent-confirm");
+    const cancelBtn  = document.getElementById("auto-consent-cancel");
+    const checks = modal.querySelectorAll('input[type="checkbox"][data-consent]');
+    const update = () => {
+      const all = Array.from(checks).every((c) => c.checked);
+      confirmBtn.disabled = !all;
+    };
+    checks.forEach((c) => { c.checked = false; c.onchange = update; });
+    update();
+    const done = (yes) => {
+      modal.style.display = "none";
+      confirmBtn.onclick = null; cancelBtn.onclick = null;
+      resolve(yes);
+    };
+    confirmBtn.onclick = () => {
+      const acks = Array.from(checks).reduce((o, c) => { o[c.dataset.consent] = c.checked; return o; }, {});
+      _appendConsent(acks);
+      done(true);
+    };
+    cancelBtn.onclick = () => done(false);
+  });
+}
+
 // ---------- init ----------
 
 refreshStatus();
 setInterval(refreshStatus, 15000);
+
+// Low-priority background ticker: keep the counterparty watch list
+// fresh without competing with hot-path RPCs. Runs every 5 minutes; the
+// first run is delayed 30s so it doesn't fire during the initial flurry
+// of load-time RPCs. Cache miss in the meantime falls back to the
+// explorer's network-wide view — see getCounterpartyWatchList.
+async function _refreshWatchListTicker() {
+  try {
+    const ids = await ensureSpendableIds();
+    for (const id of ids) {
+      await _populateCounterpartyWatchCache(id.iaddr);
+    }
+  } catch {}
+}
+setTimeout(() => { _refreshWatchListTicker(); setInterval(_refreshWatchListTicker, 5 * 60 * 1000); }, 30000);
+
+// Adaptive marketplace refresh. Two cadences:
+//   • Idle      → 30s loadMarket (baseline so a passive observer sees the
+//                 marketplace stay current even without doing anything).
+//   • Fast-follow → 5s loadMarket, armed for FAST_FOLLOW_MS after a local
+//                   action expects a counterparty reply (e.g. you posted a
+//                   request and are waiting for a match). Auto-disarms when
+//                   the deadline passes; nothing to manage explicitly.
+// Tab hidden → no polling either way (no point burning RPC in a background tab).
+//
+// Trigger fast-follow with armFastFollow() from broadcast handlers. The
+// underlying setInterval ticks at a fine granularity (2.5s) and decides
+// per-tick whether to actually call loadMarket based on the current mode.
+let _fastFollowUntil = 0;
+// Seed _lastLoadMarketAt = now so the first interval tick (at +2.5s) doesn't
+// immediately fire loadMarket — init's own populateActingPicker().then(loadMarket)
+// runs at t=0; we don't want a racing loadMarket call before the picker is
+// set, which can cause loadMarket to run with no acting identity and produce
+// weird half-init state. Idle cadence is 30s so the next real tick is at t=32.5s.
+let _lastLoadMarketAt = Date.now();
+const FAST_FOLLOW_MS = 5 * 60 * 1000;
+function armFastFollow(durationMs = FAST_FOLLOW_MS) {
+  _fastFollowUntil = Math.max(_fastFollowUntil, Date.now() + durationMs);
+}
+setInterval(() => {
+  if (typeof document !== "undefined" && document.hidden) return;
+  const fastMode = Date.now() < _fastFollowUntil;
+  const cadence = fastMode ? 5000 : 30000;
+  if (Date.now() - _lastLoadMarketAt < cadence) return;
+  _lastLoadMarketAt = Date.now();
+  loadMarket().catch(() => {});
+}, 2500);
 
 // ── Auto-confirm watcher ──────────────────────────────────────────
 // Periodically scan: for each local identity, find loan.request entries
@@ -6508,6 +6925,9 @@ setInterval(refreshStatus, 15000);
 // is excluded by verifyMatchSafety's vault input check).
 const _autoAcceptInFlight = new Set();
 async function autoAcceptWatcher() {
+  // Settings → "Pause auto-execute" disables both watchers globally without
+  // requiring per-offer changes. See TERMS.md §3 (kill-switch).
+  if (isAutoExecutePaused()) return;
   try {
     const myIaddrs = await inScopeIaddrs();
     if (myIaddrs.length === 0) return;
@@ -6626,8 +7046,8 @@ async function autoAcceptWatcher() {
     console.warn("[auto-accept] watcher error:", e);
   }
 }
-setInterval(autoAcceptWatcher, 30000);
-// Also fire shortly after page load so users don't wait 30s on first run.
+setInterval(autoAcceptWatcher, 15000);
+// Also fire shortly after page load so users don't wait a full cycle on first run.
 setTimeout(autoAcceptWatcher, 5000);
 
 // ── Lender-side history attestation watcher ────────────────────────
@@ -6902,8 +7322,11 @@ setTimeout(lenderHistoryWatcher, 8000);
 const HARD_FLOOR_RATIO = 1.5;
 const _autoFundInFlight = new Set();
 const _autoFundCandidates = new Map(); // request_txid → {detectedAt, offerId, reason}
+const _autoFundFailedAt   = new Map(); // request_txid → ms timestamp of last row-not-in-DOM
 
 async function lenderAutoFundWatcher() {
+  // Settings → "Pause auto-execute" disables both watchers globally.
+  if (isAutoExecutePaused()) return;
   try {
     const myIaddrs = await inScopeIaddrs();
     if (myIaddrs.length === 0) return;
@@ -6925,6 +7348,7 @@ async function lenderAutoFundWatcher() {
       let requests = [];
       try {
         const url = `${EXPLORER_API}/contracts/loans/requests?target_lender_iaddr=${encodeURIComponent(ia)}&pageSize=50`;
+        _recordExplorerHit(url);
         const r = await fetch(url).then((x) => x.json()).catch(() => null);
         requests = r?.results || [];
       } catch { continue; }
@@ -6932,6 +7356,12 @@ async function lenderAutoFundWatcher() {
       for (const offer of offers) {
         for (const req of requests) {
           if (_autoFundInFlight.has(req.posted_tx)) continue;
+          if (_autoFundActive.has(req.posted_tx)) continue;
+          // Cool-down: if a prior cycle hit row-not-in-DOM (daemon indexing
+          // lag), skip this request for 30s to avoid log spam while the
+          // lender's daemon catches up to the borrower's request mempool tx.
+          const lastFail = _autoFundFailedAt.get(req.posted_tx);
+          if (lastFail && (Date.now() - lastFail) < 30000) continue;
 
           const reasons = await validateAutoFundCandidate(req, offer);
           if (reasons.length === 0) {
@@ -7073,10 +7503,26 @@ async function validateAutoFundCandidate(req, offer) {
     reasons.push(`ratio ${actualRatio.toFixed(2)} < local accept floor ${acceptFloor.toFixed(2)} (offer min ${minRatio} × (1−${slippagePct}% local slippage))`);
   }
 
+  // Oracle sanity check (opt-in, default on — see Settings + METHODOLOGY.md §4).
+  // Refuses to auto-execute when the daemon's oracle returns a ratio that
+  // sits far outside the offer's stated terms — protects against e.g. a
+  // basket starvation that suddenly makes the implied price wildly off,
+  // or a daemon returning a stale/corrupt quote. Sane operators can
+  // disable for stablecoin-pair flows where wider divergence is normal.
+  if (minRatio > 0 && isOracleSanityEnabled()) {
+    const lo = 0.7 * minRatio;
+    const hi = 1.5 * minRatio;
+    if (actualRatio < lo || actualRatio > hi) {
+      reasons.push(`oracle sanity: ratio ${actualRatio.toFixed(2)} outside [${lo.toFixed(2)}, ${hi.toFixed(2)}] of offer's stated ${minRatio}× — refusing auto-execute (disable in Settings if intentional)`);
+    }
+  }
+
   return reasons;
 }
 
-setInterval(lenderAutoFundWatcher, 30000);
+setInterval(lenderAutoFundWatcher, 15000);
+// Initial fire at 12s gives loadMarket time to populate the request rows.
+// Tightening below this caused `row still not in DOM` warnings on first cycle.
 setTimeout(lenderAutoFundWatcher, 12000);
 
 // Phase 2: actually post the match for a candidate that passed validation.
@@ -7090,8 +7536,15 @@ setTimeout(lenderAutoFundWatcher, 12000);
 //   - Row not found → log + skip
 //   - Confirm button never enables in 30s → abort
 //   - Re-validation at broadcast time fails (price drifted) → dismiss panel
+// Separate from _autoFundInFlight (success-completed). _autoFundActive is
+// a re-entry guard: set on entry, cleared in finally. Prevents the watcher's
+// next 15s tick from re-firing this same request while the previous call is
+// still mid-flight (which was the source of the post-success warning storm).
+const _autoFundActive = new Set();
 async function fireAutoFundCandidate(req, offer, actingIaddr) {
   const reqTxid = req.posted_tx;
+  if (_autoFundActive.has(reqTxid)) return;
+  _autoFundActive.add(reqTxid);
   try {
     // Requests directed at us as lender render under the "loans" sub-tab
     // (the "Awaiting your action" section), NOT the "market" sub-tab —
@@ -7126,6 +7579,7 @@ async function fireAutoFundCandidate(req, offer, actingIaddr) {
         const allRows = Array.from(document.querySelectorAll(".mp-row[data-request-key]")).map((r) => r.dataset.requestKey);
         const activeOpRows = Array.from(document.querySelectorAll(".post-match-panel[data-op-active=\"1\"], .accept-panel[data-op-active=\"1\"]")).length;
         const mpTabActive = document.querySelector("[data-mp-tab].active")?.dataset.mpTab || "?";
+        _autoFundFailedAt.set(reqTxid, Date.now());
         console.warn(`[auto-fund] row still not in DOM for ${reqTxid?.slice(0,12)} — leaving for next cycle. ` +
           `mp-tab=${mpTabActive} active-ops=${activeOpRows} rows-in-dom=[${allRows.slice(0, 5).join(", ")}${allRows.length > 5 ? `, +${allRows.length-5} more` : ""}]`);
         return;
@@ -7139,18 +7593,25 @@ async function fireAutoFundCandidate(req, offer, actingIaddr) {
     _autoFundInFlight.add(reqTxid);
     fundBtn.click();
 
-    // Wait up to 30s for the confirm button to enable (balanceReady +
-    // dataset.acting + dataset.vaultAddress all set by the existing
-    // post-match panel handler).
+    // Wait for the confirm button to enable (balanceReady + dataset.acting +
+    // dataset.vaultAddress all set by the existing post-match panel handler).
+    // Slow path is getPubkeyForRAddress scanning the borrower's tx history,
+    // which can exceed any short timeout. The handler rewrites panel.innerHTML
+    // mid-async (loading state → full review), so the button node is replaced
+    // — must re-query each iteration. 5-min backstop avoids spinning forever
+    // on a stuck row; the next 30s watcher cycle will retry from scratch.
     const panel = row.querySelector(".post-match-panel");
     let confirmReady = false;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
+    const POLL_MS = 250;
+    const MAX_MS = 5 * 60 * 1000;
+    for (let waited = 0; waited < MAX_MS; waited += POLL_MS) {
+      await new Promise((r) => setTimeout(r, POLL_MS));
       const goBtn = panel?.querySelector('[data-mp-row-act="post-match-go"]');
       if (goBtn && !goBtn.disabled) { confirmReady = true; break; }
     }
     if (!confirmReady) {
-      console.warn(`[auto-fund] confirm button never enabled for ${reqTxid?.slice(0,12)} (30s timeout)`);
+      console.warn(`[auto-fund] confirm button never enabled for ${reqTxid?.slice(0,12)} (5min backstop) — clearing in-flight so next cycle retries`);
+      _autoFundInFlight.delete(reqTxid);
       return;
     }
 
@@ -7162,15 +7623,24 @@ async function fireAutoFundCandidate(req, offer, actingIaddr) {
     if (recheckReasons.length > 0) {
       console.warn(`[auto-fund] re-check failed at broadcast for ${reqTxid?.slice(0,12)}: ${recheckReasons.join(", ")} — dismissing panel`);
       panel.querySelector('[data-mp-row-act="post-match-cancel"]')?.click();
+      // Stale price / slipped floor — leave in-flight so we don't immediately
+      // re-fire on the same stale data. Next loadMarket will refresh price;
+      // if conditions improve, the user can manually click Fund.
       return;
     }
 
     console.log(`[auto-fund] firing confirm for ${reqTxid?.slice(0,12)} from offer on ${actingIaddr.slice(0,12)}`);
     panel.querySelector('[data-mp-row-act="post-match-go"]')?.click();
+    // Arm fast-follow: we just clicked Confirm, the broadcast handler will
+    // also arm but that handler runs async; arm here too so the watcher's
+    // own loadMarket cadence picks up the match without delay.
+    armFastFollow();
   } finally {
-    // Stay in _autoFundInFlight so we don't retry even after success/abort.
-    // A loadMarket cycle will see the new loan.match and the row's "Fund
-    // this loan" button will be replaced — no risk of re-firing.
+    // Re-entry guard: always clear so the next 15s watcher tick can re-fire
+    // if it still finds the request. _autoFundInFlight (above) handles the
+    // success-completed gate; on row-not-found / sub-tab-wrong we explicitly
+    // skip without setting it, leaving room for a future retry.
+    _autoFundActive.delete(reqTxid);
   }
 }
 
